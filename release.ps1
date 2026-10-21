@@ -3,7 +3,7 @@
 #   .\release.ps1 -Notes "Какво е новото"
 #   .\release.ps1 -Notes "..." -Full    # + пълен пакет (exe + bin) за първоначална инсталация
 param([string]$Notes = "", [switch]$Full)
-$ErrorActionPreference = 'Stop'
+# Без $ErrorActionPreference = 'Stop': cargo, git и gh пишат прогрес в stderr и PowerShell 5.1 би спрял.
 Set-Location $PSScriptRoot
 
 $mingw = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin"
@@ -11,7 +11,8 @@ $env:PATH = "$env:USERPROFILE\.cargo\bin;$mingw;C:\Program Files\GitHub CLI;$env
 
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
 $tag = "v$version"
-if (gh release view $tag 2>$null) { throw "Версия $tag вече е публикувана — вдигни version в Cargo.toml." }
+gh release view $tag *> $null
+if ($LASTEXITCODE -eq 0) { throw "Версия $tag вече е публикувана — вдигни version в Cargo.toml." }
 if (git status --porcelain) { throw "Има незаписани промени — направи git commit преди release." }
 
 cargo build --release
@@ -26,7 +27,8 @@ if ($Full) {
     $assets += $zip
 }
 
-git push origin HEAD
+git push -u origin HEAD
+if ($LASTEXITCODE) { throw "git push не успя." }
 gh release create $tag @assets --title "PP Downloader $tag" --notes $Notes
 if ($LASTEXITCODE) { throw "Публикуването не успя." }
 if ($Full) { Remove-Item $zip }
