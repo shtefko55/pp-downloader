@@ -32,6 +32,8 @@ pub struct JobState {
     pub progress: f32,
     pub info: String,
     pub output: Option<PathBuf>,
+    /// Въведените начало и край спрямо началото на сваления клип (без handles).
+    pub marks: (f64, f64),
 }
 
 pub type Shared = Arc<Mutex<JobState>>;
@@ -52,6 +54,7 @@ pub struct Task {
     pub cut_end: u32,
     /// Таймкодовете, въведени от потребителя — за името на файла.
     pub label: String,
+    pub marks: (f64, f64),
     pub opts: Options,
     pub state: Shared,
 }
@@ -85,7 +88,7 @@ fn find_tool(name: &str) -> Option<PathBuf> {
 }
 
 /// Команда без конзолен прозорец; папката на инструмента се добавя в PATH (за deno, ffmpeg и т.н.).
-fn command(tool: &Path) -> Command {
+pub(crate) fn command(tool: &Path) -> Command {
     let mut cmd = Command::new(tool);
     cmd.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null());
     if let Some(dir) = tool.parent() {
@@ -107,7 +110,11 @@ fn tail(text: &str, lines: usize) -> String {
 }
 
 /// Пуска процес, връща stdout; при грешка — последните редове от stderr.
-fn run_capture(mut cmd: Command, cancel: &AtomicBool) -> Result<String, String> {
+pub(crate) fn run_capture(cmd: Command, cancel: &AtomicBool) -> Result<String, String> {
+    run_bytes(cmd, cancel).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+pub(crate) fn run_bytes(mut cmd: Command, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("Не може да се стартира: {e}"))?;
     let mut out = child.stdout.take().unwrap();
@@ -130,11 +137,11 @@ fn run_capture(mut cmd: Command, cancel: &AtomicBool) -> Result<String, String> 
         }
         match child.try_wait() {
             Ok(Some(s)) => break s,
-            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Ok(None) => thread::sleep(Duration::from_millis(15)),
             Err(e) => return Err(e.to_string()),
         }
     };
-    let out = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).into_owned();
+    let out = t_out.join().unwrap_or_default();
     let err = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).into_owned();
     if status.success() {
         Ok(out)
@@ -189,6 +196,7 @@ pub fn ensure_workers(
                         st.progress = 1.0;
                         st.info = format!("Готово: {}", path.file_name().unwrap_or_default().to_string_lossy());
                         st.output = Some(path);
+                        st.marks = task.marks;
                     }
                     Err(e) if e == CANCELLED => {
                         st.status = Status::Cancelled;
@@ -357,7 +365,9 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
     } else {
         cmd.args(["-c:v", "libx264", "-preset", "slow", "-crf"])
             .arg(task.opts.crf.to_string())
-            .args(["-pix_fmt", "yuv420p", "-profile:v", "high"]);
+            .args(["-pix_fmt", "yuv420p", "-profile:v", "high", "-g"])
+            // Ключов кадър всяка секунда — по-бързо превъртане в редактора.
+            .arg(info["fps"].as_f64().map_or(25, |f| f.round().max(1.0) as u32).to_string());
     }
     if copy_audio {
         cmd.args(["-c:a", "copy"]);
@@ -450,7 +460,7 @@ fn find_og_title(html: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-fn run_ffmpeg(mut cmd: Command, dur: f64, cancel: &AtomicBool, on_progress: impl Fn(f32)) -> Result<(), String> {
+pub(crate) fn run_ffmpeg(mut cmd: Command, dur: f64, cancel: &AtomicBool, on_progress: impl Fn(f32)) -> Result<(), String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("ffmpeg не може да се стартира: {e}"))?;
     let stdout = child.stdout.take().unwrap();
@@ -536,6 +546,7 @@ mod tests {
                 cut_start: 100,
                 cut_end: 130,
                 label: format!("test_{precise}_{}", url.len()),
+                marks: (5.0, 25.0),
                 opts: Options { out_dir: out_dir.clone(), precise, max_res: 0, crf: 16 },
                 state: Default::default(),
             };

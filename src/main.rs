@@ -1,12 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod blur;
+mod editor;
+mod export;
+mod media;
 mod worker;
 
 use eframe::egui;
+use editor::{EditState, Editor};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use worker::{fmt_secs, Shared, Status, Task, Tools};
@@ -45,6 +50,9 @@ struct Job {
     name: String,
     start: Tc,
     end: Tc,
+    /// Свален файл + IN/OUT в него — за да остане достъпен след рестарт.
+    #[serde(default)]
+    done: Option<(PathBuf, f64, f64)>,
     #[serde(skip)]
     state: Shared,
 }
@@ -78,11 +86,16 @@ struct Saved {
     settings: Settings,
     jobs: Vec<Job>,
     next_id: u64,
+    /// Редакциите по път към файла (IN/OUT, маски).
+    #[serde(default)]
+    edits: HashMap<String, EditState>,
 }
 
 struct App {
     saved: Saved,
     tools: Tools,
+    editors: Vec<Editor>,
+    editor_msg: String,
     queue: Arc<Mutex<VecDeque<Task>>>,
     active: Arc<AtomicUsize>,
     cancel: Arc<AtomicBool>,
@@ -108,15 +121,35 @@ impl App {
             saved.next_id += 1;
             saved.jobs.push(new_job(saved.next_id));
         }
-        App {
+        for job in &mut saved.jobs {
+            match &job.done {
+                Some((path, a, b)) if path.is_file() => {
+                    let mut st = job.state.lock().unwrap();
+                    st.status = Status::Done;
+                    st.progress = 1.0;
+                    st.info = format!("Готово: {}", path.file_name().unwrap_or_default().to_string_lossy());
+                    st.output = Some(path.clone());
+                    st.marks = (*a, *b);
+                }
+                _ => job.done = None,
+            }
+        }
+        let mut app = App {
             saved,
             tools: Tools::find(),
+            editors: Vec::new(),
+            editor_msg: String::new(),
             queue: Default::default(),
             active: Default::default(),
             cancel: Default::default(),
             update_msg: Default::default(),
             scroll_to_add: false,
+        };
+        // Видео, пуснато върху PP_Downloader.exe, се отваря направо в редактора.
+        if let Some(file) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
+            app.open_editor(file, None, &cc.egui_ctx);
         }
+        app
     }
 
     fn add_job(&mut self, url: String, start: Tc, end: Tc) {
@@ -157,6 +190,10 @@ impl App {
                 cut_start: job.start.secs().saturating_sub(s.handles),
                 cut_end: job.end.secs() + s.handles,
                 label: format!("{}_{}", job.start.file_label(), job.end.file_label()),
+                marks: {
+                    let cut = job.start.secs().saturating_sub(s.handles) as f64;
+                    (job.start.secs() as f64 - cut, job.end.secs() as f64 - cut)
+                },
                 opts: opts.clone(),
                 state: job.state.clone(),
             });
@@ -171,6 +208,31 @@ impl App {
             let mut st = task.state.lock().unwrap();
             st.status = Status::Idle;
             st.info.clear();
+        }
+    }
+
+    fn open_editor(&mut self, path: PathBuf, marks: Option<(f64, f64)>, ctx: &egui::Context) {
+        if let Some(e) = self.editors.iter().find(|e| e.path == path) {
+            ctx.send_viewport_cmd_to(e.viewport, egui::ViewportCommand::Focus);
+            return;
+        }
+        let Some(ffmpeg) = self.tools.ffmpeg.clone() else {
+            self.editor_msg = "Липсва ffmpeg.exe".into();
+            return;
+        };
+        let saved = self.saved.edits.get(&path.display().to_string()).cloned();
+        match Editor::open(path, ffmpeg, self.saved.settings.crf, saved, marks, ctx) {
+            Ok(e) => {
+                self.editor_msg.clear();
+                self.editors.push(e);
+            }
+            Err(e) => self.editor_msg = format!("Видеото не може да се отвори: {e}"),
+        }
+    }
+
+    fn store_edits(&mut self) {
+        for e in &self.editors {
+            self.saved.edits.insert(e.path.display().to_string(), e.state.clone());
         }
     }
 
@@ -221,10 +283,15 @@ impl App {
         let handles = self.saved.settings.handles;
         let mut remove = None;
         let mut duplicate = None;
+        let mut edit = None;
         for (idx, job) in self.saved.jobs.iter_mut().enumerate() {
-            let (status, progress, info, output) = {
+            let (status, progress, info, output, marks) = {
                 let st = job.state.lock().unwrap();
-                (st.status, st.progress, st.info.clone(), st.output.clone())
+                (st.status, st.progress, st.info.clone(), st.output.clone(), st.marks)
+            };
+            job.done = match (&output, status) {
+                (Some(p), Status::Done) => Some((p.clone(), marks.0, marks.1)),
+                _ => None,
             };
             let busy = matches!(status, Status::Queued | Status::Working);
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -274,10 +341,11 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.colored_label(egui::Color32::from_rgb(40, 170, 80), format!("✔ {info}"));
                             if let Some(p) = output {
+                                if ui.add(colored_button("✂ Редактирай", PURPLE)).clicked() {
+                                    edit = Some((p.clone(), marks));
+                                }
                                 if ui.small_button("Покажи файла").clicked() {
-                                    let _ = std::process::Command::new("explorer")
-                                        .raw_arg(format!("/select,\"{}\"", p.display()))
-                                        .spawn();
+                                    show_in_explorer(&p);
                                 }
                             }
                         });
@@ -307,6 +375,9 @@ impl App {
         if let Some(i) = remove {
             self.saved.jobs.remove(i);
         }
+        if let Some((path, marks)) = edit {
+            self.open_editor(path, Some(marks), ui.ctx());
+        }
 
         ui.add_space(4.0);
         let add = ui.add(colored_button("➕  Добави линк", BLUE).min_size(egui::vec2(160.0, 30.0)));
@@ -324,6 +395,7 @@ impl App {
 const GREEN: egui::Color32 = egui::Color32::from_rgb(46, 140, 70);
 const RED: egui::Color32 = egui::Color32::from_rgb(180, 55, 55);
 const BLUE: egui::Color32 = egui::Color32::from_rgb(45, 105, 180);
+const PURPLE: egui::Color32 = egui::Color32::from_rgb(120, 80, 170);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(170, 115, 30);
 const SLATE: egui::Color32 = egui::Color32::from_rgb(75, 85, 100);
 
@@ -331,8 +403,20 @@ fn colored_button(text: &str, fill: egui::Color32) -> egui::Button<'static> {
     egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE).strong()).fill(fill)
 }
 
+fn show_in_explorer(path: &Path) {
+    let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
+}
+
 fn new_job(id: u64) -> Job {
-    Job { id, url: String::new(), name: String::new(), start: Tc::default(), end: Tc::default(), state: Default::default() }
+    Job {
+        id,
+        url: String::new(),
+        name: String::new(),
+        start: Tc::default(),
+        end: Tc::default(),
+        done: None,
+        state: Default::default(),
+    }
 }
 
 /// Три падащи менюта ЧЧ:ММ:СС + поле за бързо въвеждане на таймкод.
@@ -397,6 +481,16 @@ impl eframe::App for App {
                             ctx.request_repaint();
                         });
                     }
+                    if ui.add(colored_button("📂 Отвори видео…", PURPLE).min_size(big)).on_hover_text("Редактирай вече свален файл").clicked() {
+                        let dir = &self.saved.settings.out_dir;
+                        if let Some(p) = rfd::FileDialog::new()
+                            .set_directory(dir)
+                            .add_filter("Видео", &["mp4", "mov", "mkv", "m4v", "webm"])
+                            .pick_file()
+                        {
+                            self.open_editor(p, None, ctx);
+                        }
+                    }
                     if ui.add(colored_button("Изчисти готовите", AMBER).min_size(big)).clicked() {
                         self.saved.jobs.retain(|j| j.state.lock().unwrap().status != Status::Done);
                         if self.saved.jobs.is_empty() {
@@ -406,6 +500,9 @@ impl eframe::App for App {
                     ui.weak(self.update_msg.lock().unwrap().as_str());
                 });
             });
+            if !self.editor_msg.is_empty() {
+                ui.colored_label(egui::Color32::from_rgb(220, 60, 60), &self.editor_msg);
+            }
             if self.tools.ytdlp.is_none() || self.tools.ffmpeg.is_none() {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 60, 60),
@@ -443,9 +540,18 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.jobs_ui(ui));
         });
+
+        for e in &mut self.editors {
+            e.show(ctx);
+        }
+        if self.editors.iter().any(|e| !e.open) {
+            self.store_edits();
+            self.editors.retain(|e| e.open);
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.store_edits();
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
 
