@@ -142,7 +142,7 @@ mod tests {
             height: 720,
             fps: 25.0,
             has_audio: true,
-            state: EditState { in_t: 1.0, out_t: 3.0, masks: vec![mask] },
+            state: EditState { in_t: 1.0, out_t: 3.0, masks: vec![mask], exported: None },
             crf: 16,
         };
         run(&job, &AtomicBool::new(false), |_| {}).unwrap();

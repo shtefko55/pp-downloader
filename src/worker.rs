@@ -503,7 +503,7 @@ pub fn fmt_secs(t: u32) -> String {
     format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60)
 }
 
-fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c })

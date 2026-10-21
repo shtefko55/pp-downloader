@@ -4,16 +4,19 @@ mod blur;
 mod editor;
 mod export;
 mod media;
+mod project;
 mod worker;
 
 use eframe::egui;
 use editor::{EditState, Editor};
+use project::Project;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use worker::{fmt_secs, Shared, Status, Task, Tools};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq)]
@@ -53,12 +56,16 @@ struct Job {
     /// Свален файл + IN/OUT в него — за да остане достъпен след рестарт.
     #[serde(default)]
     done: Option<(PathBuf, f64, f64)>,
+    /// IN/OUT, маски и последен експорт от редактора.
+    #[serde(default)]
+    edit: Option<EditState>,
     #[serde(skip)]
     state: Shared,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Settings {
+    /// Папката, в която се създават проектите (всеки в своя подпапка).
     out_dir: String,
     handles: u32,
     parallel: usize,
@@ -84,15 +91,29 @@ impl Default for Settings {
 #[derive(Serialize, Deserialize, Default)]
 struct Saved {
     settings: Settings,
+    /// Последно отваряните проекти, най-новият първи.
+    #[serde(default)]
+    recent: Vec<PathBuf>,
+    #[serde(default)]
+    current: Option<PathBuf>,
+    // Списъкът от версиите преди проектите — пренася се в проект „Без име“.
+    #[serde(default)]
     jobs: Vec<Job>,
+    #[serde(default)]
     next_id: u64,
-    /// Редакциите по път към файла (IN/OUT, маски).
     #[serde(default)]
     edits: HashMap<String, EditState>,
 }
 
 struct App {
     saved: Saved,
+    project: Project,
+    /// Последно записаното съдържание на проекта — записва се само при промяна.
+    last_json: String,
+    last_autosave: Instant,
+    title: String,
+    project_msg: String,
+    new_project: Option<String>,
     tools: Tools,
     editors: Vec<Editor>,
     editor_msg: String,
@@ -102,6 +123,8 @@ struct App {
     update_msg: Arc<Mutex<String>>,
     scroll_to_add: bool,
 }
+
+const UNNAMED: &str = "Без име";
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -117,25 +140,57 @@ impl App {
         });
 
         let mut saved: Saved = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
-        if saved.jobs.is_empty() {
-            saved.next_id += 1;
-            saved.jobs.push(new_job(saved.next_id));
-        }
-        for job in &mut saved.jobs {
-            match &job.done {
-                Some((path, a, b)) if path.is_file() => {
-                    let mut st = job.state.lock().unwrap();
-                    st.status = Status::Done;
-                    st.progress = 1.0;
-                    st.info = format!("Готово: {}", path.file_name().unwrap_or_default().to_string_lossy());
-                    st.output = Some(path.clone());
-                    st.marks = (*a, *b);
+        let mut project_msg = String::new();
+        let root = PathBuf::from(&saved.settings.out_dir);
+        let mut project = match saved.current.as_deref().map(Project::load) {
+            Some(Ok(p)) => p,
+            other => {
+                if let Some(Err(e)) = other {
+                    project_msg = e;
                 }
-                _ => job.done = None,
+                Project::create(&root, UNNAMED).unwrap_or_else(|e| {
+                    project_msg = e;
+                    Project { name: UNNAMED.into(), path: std::env::temp_dir().join(format!("{UNNAMED}.{}", project::EXT)), ..Default::default() }
+                })
             }
+        };
+        // Пренасяне на стария общ списък (отпреди проектите).
+        if !saved.jobs.is_empty() || !saved.edits.is_empty() {
+            let mut edits = std::mem::take(&mut saved.edits);
+            for mut job in std::mem::take(&mut saved.jobs) {
+                if job.url.trim().is_empty() && job.done.is_none() {
+                    continue;
+                }
+                project.next_id += 1;
+                job.id = project.next_id;
+                job.edit = job.done.as_ref().and_then(|(p, _, _)| edits.remove(&p.display().to_string()));
+                project.jobs.push(job);
+            }
+            // Редактирани файлове без ред в списъка влизат като „видео от диска“.
+            let temp = std::env::temp_dir();
+            for (path, edit) in edits {
+                let path = PathBuf::from(path);
+                if !path.is_file() || path.starts_with(&temp) {
+                    continue;
+                }
+                project.next_id += 1;
+                let mut job = new_job(project.next_id);
+                job.name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                job.done = Some((path, 0.0, 0.0));
+                job.edit = Some(edit);
+                project.jobs.push(job);
+            }
+            let _ = project.save();
         }
+
         let mut app = App {
             saved,
+            project,
+            last_json: String::new(),
+            last_autosave: Instant::now(),
+            title: String::new(),
+            project_msg,
+            new_project: None,
             tools: Tools::find(),
             editors: Vec::new(),
             editor_msg: String::new(),
@@ -145,32 +200,91 @@ impl App {
             update_msg: Default::default(),
             scroll_to_add: false,
         };
+        app.project_opened();
         // Видео, пуснато върху PP_Downloader.exe, се отваря направо в редактора.
         if let Some(file) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
-            app.open_editor(file, None, &cc.egui_ctx);
+            app.open_file(file, &cc.egui_ctx);
         }
         app
     }
 
+    /// След зареждане на проект: състояния на откъсите, последни проекти, запомняне.
+    fn project_opened(&mut self) {
+        for job in &mut self.project.jobs {
+            let mut st = job.state.lock().unwrap();
+            match &job.done {
+                Some((path, a, b)) if path.is_file() => {
+                    st.status = Status::Done;
+                    st.progress = 1.0;
+                    st.info = format!("Готово: {}", path.file_name().unwrap_or_default().to_string_lossy());
+                    st.output = Some(path.clone());
+                    st.marks = (*a, *b);
+                }
+                Some((path, _, _)) => {
+                    st.info = format!(
+                        "⚠ Суровият файл липсва ({}) — свали го отново",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
+                None => {}
+            }
+        }
+        if self.project.jobs.is_empty() {
+            self.add_job(String::new(), Tc::default(), Tc::default());
+        }
+        let path = self.project.path.clone();
+        self.saved.recent.retain(|p| p != &path);
+        self.saved.recent.insert(0, path.clone());
+        self.saved.recent.truncate(12);
+        self.saved.current = Some(path);
+        self.last_json = self.project.to_json();
+    }
+
+    fn busy(&self) -> bool {
+        self.active.load(Ordering::SeqCst) > 0 || !self.queue.lock().unwrap().is_empty()
+    }
+
+    fn switch_project(&mut self, result: Result<Project, String>) {
+        if self.busy() {
+            self.project_msg = "Изчакай свалянето да приключи (или го спри), преди да смениш проекта.".into();
+            return;
+        }
+        match result {
+            Ok(p) => {
+                self.store_edits();
+                if let Err(e) = self.project.save() {
+                    self.project_msg = e;
+                    return;
+                }
+                self.editors.clear();
+                self.project = p;
+                self.project_msg.clear();
+                self.project_opened();
+            }
+            Err(e) => self.project_msg = e,
+        }
+    }
+
     fn add_job(&mut self, url: String, start: Tc, end: Tc) {
-        self.saved.next_id += 1;
-        let mut job = new_job(self.saved.next_id);
+        self.project.next_id += 1;
+        let mut job = new_job(self.project.next_id);
         job.url = url;
         job.start = start;
         job.end = end;
-        self.saved.jobs.push(job);
+        self.project.jobs.push(job);
     }
 
-    fn start_all(&mut self, ctx: &egui::Context) {
+    /// Пуска всички чакащи откъси, или само един (`only`).
+    fn start_jobs(&mut self, ctx: &egui::Context, only: Option<u64>) {
         let s = &self.saved.settings;
         let opts = worker::Options {
-            out_dir: PathBuf::from(&s.out_dir),
+            out_dir: self.project.dir(),
             precise: s.precise,
             max_res: s.max_res,
             crf: s.crf,
         };
         let mut queue = self.queue.lock().unwrap();
-        for job in &self.saved.jobs {
+        for job in self.project.jobs.iter().filter(|j| only.map_or(true, |id| j.id == id)) {
             let mut st = job.state.lock().unwrap();
             if matches!(st.status, Status::Queued | Status::Working | Status::Done) || job.url.trim().is_empty() {
                 continue;
@@ -211,7 +325,7 @@ impl App {
         }
     }
 
-    fn open_editor(&mut self, path: PathBuf, marks: Option<(f64, f64)>, ctx: &egui::Context) {
+    fn open_editor(&mut self, path: PathBuf, marks: Option<(f64, f64)>, edit: Option<EditState>, ctx: &egui::Context) {
         if let Some(e) = self.editors.iter().find(|e| e.path == path) {
             ctx.send_viewport_cmd_to(e.viewport, egui::ViewportCommand::Focus);
             return;
@@ -220,8 +334,8 @@ impl App {
             self.editor_msg = "Липсва ffmpeg.exe".into();
             return;
         };
-        let saved = self.saved.edits.get(&path.display().to_string()).cloned();
-        match Editor::open(path, ffmpeg, self.saved.settings.crf, saved, marks, ctx) {
+        let marks = marks.filter(|(a, b)| b > a);
+        match Editor::open(path, ffmpeg, self.saved.settings.crf, edit, marks, self.project.exports_dir(), ctx) {
             Ok(e) => {
                 self.editor_msg.clear();
                 self.editors.push(e);
@@ -230,25 +344,142 @@ impl App {
         }
     }
 
+    /// Видео от диска: ако вече е в проекта — отваря неговата редакция, иначе го добавя.
+    fn open_file(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let existing = self.project.jobs.iter().find(|j| j.done.as_ref().is_some_and(|d| d.0 == path));
+        if let Some(job) = existing {
+            let (marks, edit) = (job.done.as_ref().map(|d| (d.1, d.2)), job.edit.clone());
+            self.open_editor(path, marks, edit, ctx);
+            return;
+        }
+        if self.project.jobs.len() == 1 && self.project.jobs[0].url.trim().is_empty() && self.project.jobs[0].done.is_none() {
+            self.project.jobs.clear();
+        }
+        self.project.next_id += 1;
+        let mut job = new_job(self.project.next_id);
+        job.name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        job.done = Some((path.clone(), 0.0, 0.0));
+        {
+            let mut st = job.state.lock().unwrap();
+            st.status = Status::Done;
+            st.progress = 1.0;
+            st.info = format!("Готово: {}", path.file_name().unwrap_or_default().to_string_lossy());
+            st.output = Some(path.clone());
+        }
+        self.project.jobs.push(job);
+        self.open_editor(path, None, None, ctx);
+    }
+
+    /// Копира IN/OUT, маските и експорта от отворените редактори в откъсите на проекта.
     fn store_edits(&mut self) {
         for e in &self.editors {
-            self.saved.edits.insert(e.path.display().to_string(), e.state.clone());
+            if let Some(job) = self.project.jobs.iter_mut().find(|j| j.done.as_ref().is_some_and(|d| d.0 == e.path)) {
+                job.edit = Some(e.state.clone());
+            }
+        }
+    }
+
+    fn autosave(&mut self) {
+        self.store_edits();
+        let json = self.project.to_json();
+        if json != self.last_json {
+            match project::write_atomic(&self.project.path, &json) {
+                Ok(()) => self.last_json = json,
+                Err(e) => self.project_msg = e,
+            }
+        }
+    }
+
+    fn project_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let busy = self.busy();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Проект:").strong().size(16.0));
+            let mut pick = None;
+            egui::ComboBox::from_id_salt("project")
+                .width(260.0)
+                .selected_text(egui::RichText::new(&self.project.name).strong().size(16.0))
+                .show_ui(ui, |ui| {
+                    for p in &self.saved.recent {
+                        let name = p.file_stem().unwrap_or_default().to_string_lossy();
+                        let current = *p == self.project.path;
+                        let label = if p.is_file() { name.into_owned() } else { format!("{name} (липсва)") };
+                        if ui.selectable_label(current, label).on_hover_text(p.display().to_string()).clicked() && !current {
+                            pick = Some(p.clone());
+                        }
+                    }
+                });
+            if let Some(p) = pick {
+                let result = Project::load(&p);
+                if result.is_err() {
+                    self.saved.recent.retain(|r| r != &p);
+                }
+                self.switch_project(result);
+            }
+            if ui.add_enabled(!busy, colored_button("➕ Нов проект", BLUE)).clicked() {
+                self.new_project = Some(String::new());
+            }
+            if ui.add_enabled(!busy, colored_button("📂 Отвори проект…", SLATE)).clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_directory(&self.saved.settings.out_dir)
+                    .add_filter("PP проект", &[project::EXT])
+                    .pick_file()
+                {
+                    let result = Project::load(&p);
+                    self.switch_project(result);
+                }
+            }
+            if ui.button("Папка на проекта").clicked() {
+                let _ = std::process::Command::new("explorer").arg(self.project.dir()).spawn();
+            }
+            ui.weak(self.project.path.display().to_string());
+        });
+        if !self.project_msg.is_empty() {
+            ui.colored_label(egui::Color32::from_rgb(220, 60, 60), &self.project_msg);
+        }
+
+        if let Some(name) = &mut self.new_project {
+            let mut close = false;
+            let mut create = false;
+            egui::Window::new("Нов проект")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("Име на проекта:");
+                    let r = ui.add(egui::TextEdit::singleline(name).hint_text("напр. Предаване 100").desired_width(320.0));
+                    r.request_focus();
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        create = true;
+                    }
+                    let folder = Path::new(&self.saved.settings.out_dir).join(worker::sanitize(name.trim()));
+                    ui.weak(format!("Папка: {}", folder.display()));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        create |= ui.add(colored_button("Създай", GREEN).min_size(egui::vec2(100.0, 28.0))).clicked();
+                        close = ui.button("Отказ").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    });
+                });
+            if create {
+                let name = name.clone();
+                let result = Project::create(Path::new(&self.saved.settings.out_dir), &name);
+                self.new_project = None;
+                self.switch_project(result);
+            } else if close {
+                self.new_project = None;
+            }
         }
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let s = &mut self.saved.settings;
         ui.horizontal(|ui| {
-            ui.label("Папка за запис:");
-            ui.add(egui::TextEdit::singleline(&mut s.out_dir).desired_width(420.0));
+            ui.label("Папка за проекти:");
+            ui.add(egui::TextEdit::singleline(&mut s.out_dir).desired_width(420.0))
+                .on_hover_text("Всеки нов проект се създава в своя подпапка тук.");
             if ui.button("📁 Избери…").clicked() {
                 if let Some(dir) = rfd::FileDialog::new().set_directory(&s.out_dir).pick_folder() {
                     s.out_dir = dir.display().to_string();
                 }
-            }
-            if ui.button("Отвори").clicked() {
-                let _ = std::fs::create_dir_all(&s.out_dir);
-                let _ = std::process::Command::new("explorer").arg(&s.out_dir).spawn();
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -284,53 +515,73 @@ impl App {
         let mut remove = None;
         let mut duplicate = None;
         let mut edit = None;
-        for (idx, job) in self.saved.jobs.iter_mut().enumerate() {
+        let mut redownload = None;
+        for (idx, job) in self.project.jobs.iter_mut().enumerate() {
             let (status, progress, info, output, marks) = {
                 let st = job.state.lock().unwrap();
                 (st.status, st.progress, st.info.clone(), st.output.clone(), st.marks)
             };
-            job.done = match (&output, status) {
-                (Some(p), Status::Done) => Some((p.clone(), marks.0, marks.1)),
-                _ => None,
-            };
+            // Липсващ суров файл се помни, докато не бъде свален отново.
+            match (&output, status) {
+                (Some(p), Status::Done) => job.done = Some((p.clone(), marks.0, marks.1)),
+                (_, Status::Idle) if job.done.as_ref().is_some_and(|d| !d.0.is_file()) => {}
+                _ => job.done = None,
+            }
             let busy = matches!(status, Status::Queued | Status::Working);
+            let imported = job.url.trim().is_empty() && job.done.is_some();
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.add_enabled_ui(!busy, |ui| {
                     ui.horizontal(|ui| {
                         ui.strong(format!("{:>2}.", idx + 1));
                         let w = (ui.available_width() - 330.0).max(200.0);
-                        let r = ui.add(egui::TextEdit::singleline(&mut job.url).hint_text("Линк (YouTube, bnt.bg …)").desired_width(w));
+                        let hint = if imported { "(видео от диска)" } else { "Линк (YouTube, bnt.bg …)" };
+                        let r = ui.add(egui::TextEdit::singleline(&mut job.url).hint_text(hint).desired_width(w));
                         ui.add(egui::TextEdit::singleline(&mut job.name).hint_text("Име на файла (по избор)").desired_width(200.0));
                         if ui.button("⧉").on_hover_text("Дублирай (същият линк, друг откъс)").clicked() {
                             duplicate = Some(idx);
                         }
-                        if ui.button("✖").on_hover_text("Премахни").clicked() {
+                        if ui.button("✖").on_hover_text("Премахни от проекта").clicked() {
                             remove = Some(idx);
                         }
                         if r.changed() && matches!(status, Status::Done | Status::Failed | Status::Cancelled) {
                             *job.state.lock().unwrap() = Default::default();
                         }
                     });
-                    ui.horizontal(|ui| {
-                        let changed_a = tc_ui(ui, ("start", job.id), "Начало:", &mut job.start);
-                        ui.add_space(16.0);
-                        let changed_b = tc_ui(ui, ("end", job.id), "Край:", &mut job.end);
-                        if (changed_a || changed_b) && matches!(status, Status::Done | Status::Failed | Status::Cancelled) {
-                            *job.state.lock().unwrap() = Default::default();
-                        }
-                        ui.add_space(16.0);
-                        let (a, b) = (job.start.secs(), job.end.secs());
-                        if b > a {
-                            let (ca, cb) = (a.saturating_sub(handles), b + handles);
-                            ui.weak(format!("Реже се: {} – {}  ({})", fmt_secs(ca), fmt_secs(cb), fmt_secs(cb - ca)));
-                        } else if a > 0 || b > 0 {
-                            ui.colored_label(egui::Color32::from_rgb(220, 120, 0), "Краят трябва да е след началото");
-                        }
-                    });
+                    if !imported {
+                        ui.horizontal(|ui| {
+                            let changed_a = tc_ui(ui, ("start", job.id), "Начало:", &mut job.start);
+                            ui.add_space(16.0);
+                            let changed_b = tc_ui(ui, ("end", job.id), "Край:", &mut job.end);
+                            if (changed_a || changed_b) && matches!(status, Status::Done | Status::Failed | Status::Cancelled) {
+                                *job.state.lock().unwrap() = Default::default();
+                            }
+                            ui.add_space(16.0);
+                            let (a, b) = (job.start.secs(), job.end.secs());
+                            if b > a {
+                                let (ca, cb) = (a.saturating_sub(handles), b + handles);
+                                ui.weak(format!("Реже се: {} – {}  ({})", fmt_secs(ca), fmt_secs(cb), fmt_secs(cb - ca)));
+                            } else if a > 0 || b > 0 {
+                                ui.colored_label(egui::Color32::from_rgb(220, 120, 0), "Краят трябва да е след началото");
+                            }
+                        });
+                    }
                 });
+                let exported = job.edit.as_ref().and_then(|e| e.exported.clone());
                 match status {
-                    Status::Idle => {}
+                    Status::Idle => {
+                        if !info.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(egui::Color32::from_rgb(230, 150, 30), &info);
+                                if !job.url.trim().is_empty() && ui.add(colored_button("⬇ Свали отново", GREEN)).clicked() {
+                                    redownload = Some(job.id);
+                                }
+                            });
+                        }
+                        if job.edit.is_some() {
+                            ui.weak("✂ Редакцията (IN/OUT, маски) е запазена и ще се приложи след сваляне.");
+                        }
+                    }
                     Status::Queued => {
                         ui.weak(info);
                     }
@@ -341,11 +592,24 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.colored_label(egui::Color32::from_rgb(40, 170, 80), format!("✔ {info}"));
                             if let Some(p) = output {
-                                if ui.add(colored_button("✂ Редактирай", PURPLE)).clicked() {
-                                    edit = Some((p.clone(), marks));
+                                let label = if job.edit.is_some() { "✂ Редактирай (има промени)" } else { "✂ Редактирай" };
+                                if ui.add(colored_button(label, PURPLE)).clicked() {
+                                    edit = Some((p.clone(), marks, job.edit.clone()));
                                 }
                                 if ui.small_button("Покажи файла").clicked() {
                                     show_in_explorer(&p);
+                                }
+                            }
+                            if let Some(x) = &exported {
+                                ui.separator();
+                                let name = x.file_name().unwrap_or_default().to_string_lossy();
+                                if x.is_file() {
+                                    ui.label(format!("➜ Експортиран: {name}"));
+                                    if ui.small_button("Покажи").clicked() {
+                                        show_in_explorer(x);
+                                    }
+                                } else {
+                                    ui.weak(format!("➜ {name} (файлът липсва — експортирай отново)"));
                                 }
                             }
                         });
@@ -361,22 +625,27 @@ impl App {
         }
         if let Some(i) = duplicate {
             let (url, name, end) = {
-                let j = &self.saved.jobs[i];
+                let j = &self.project.jobs[i];
                 (j.url.clone(), j.name.clone(), j.end)
             };
-            self.saved.next_id += 1;
-            let mut job = new_job(self.saved.next_id);
+            self.project.next_id += 1;
+            let mut job = new_job(self.project.next_id);
             job.url = url;
             job.name = name;
             job.start = end;
             job.end = end;
-            self.saved.jobs.insert(i + 1, job);
+            self.project.jobs.insert(i + 1, job);
         }
         if let Some(i) = remove {
-            self.saved.jobs.remove(i);
+            let path = self.project.jobs[i].done.as_ref().map(|d| d.0.clone());
+            self.editors.retain(|e| Some(&e.path) != path.as_ref());
+            self.project.jobs.remove(i);
         }
-        if let Some((path, marks)) = edit {
-            self.open_editor(path, Some(marks), ui.ctx());
+        if let Some((path, marks, state)) = edit {
+            self.open_editor(path, Some(marks), state, ui.ctx());
+        }
+        if let Some(id) = redownload {
+            self.start_jobs(ui.ctx(), Some(id));
         }
 
         ui.add_space(4.0);
@@ -415,6 +684,7 @@ fn new_job(id: u64) -> Job {
         start: Tc::default(),
         end: Tc::default(),
         done: None,
+        edit: None,
         state: Default::default(),
     }
 }
@@ -464,7 +734,13 @@ impl eframe::App for App {
             worker::ensure_workers(&self.queue, &self.active, &self.cancel, self.saved.settings.parallel, &self.tools, ctx);
         }
 
-        let busy = active > 0 || !self.queue.lock().unwrap().is_empty();
+        let title = format!("PP Downloader — {}", self.project.name);
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+
+        let busy = self.busy();
         let big = egui::vec2(150.0, 32.0);
 
         egui::TopBottomPanel::top("settings").show(ctx, |ui| {
@@ -481,25 +757,27 @@ impl eframe::App for App {
                             ctx.request_repaint();
                         });
                     }
-                    if ui.add(colored_button("📂 Отвори видео…", PURPLE).min_size(big)).on_hover_text("Редактирай вече свален файл").clicked() {
-                        let dir = &self.saved.settings.out_dir;
+                    if ui.add(colored_button("📂 Отвори видео…", PURPLE).min_size(big)).on_hover_text("Добави видео от диска в проекта и го редактирай").clicked() {
                         if let Some(p) = rfd::FileDialog::new()
-                            .set_directory(dir)
+                            .set_directory(self.project.dir())
                             .add_filter("Видео", &["mp4", "mov", "mkv", "m4v", "webm"])
                             .pick_file()
                         {
-                            self.open_editor(p, None, ctx);
+                            self.open_file(p, ctx);
                         }
                     }
-                    if ui.add(colored_button("Изчисти готовите", AMBER).min_size(big)).clicked() {
-                        self.saved.jobs.retain(|j| j.state.lock().unwrap().status != Status::Done);
-                        if self.saved.jobs.is_empty() {
+                    if ui.add(colored_button("Изчисти готовите", AMBER).min_size(big)).on_hover_text("Махни свалените откъси от списъка на проекта").clicked() {
+                        self.project.jobs.retain(|j| j.state.lock().unwrap().status != Status::Done);
+                        if self.project.jobs.is_empty() {
                             self.add_job(String::new(), Tc::default(), Tc::default());
                         }
                     }
                     ui.weak(self.update_msg.lock().unwrap().as_str());
                 });
             });
+            ui.separator();
+            self.project_ui(ui, ctx);
+            ui.separator();
             if !self.editor_msg.is_empty() {
                 ui.colored_label(egui::Color32::from_rgb(220, 60, 60), &self.editor_msg);
             }
@@ -517,19 +795,21 @@ impl eframe::App for App {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.add(colored_button("⬇  Свали всички", GREEN).min_size(big)).clicked() {
-                    self.start_all(ctx);
+                    self.start_jobs(ctx, None);
                 }
                 if ui.add_enabled(busy, colored_button("⏹ Спри", RED).min_size(egui::vec2(80.0, 32.0))).clicked() {
                     self.stop_all();
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let jobs = &self.saved.jobs;
+                    let jobs = &self.project.jobs;
                     let count = |s: Status| jobs.iter().filter(|j| j.state.lock().unwrap().status == s).count();
+                    let exported = jobs.iter().filter(|j| j.edit.as_ref().is_some_and(|e| e.exported.is_some())).count();
                     ui.weak(format!(
-                        "{} откъса · {} готови · {} грешки",
+                        "{} откъса · {} свалени · {} експортирани · {} грешки",
                         jobs.len(),
                         count(Status::Done),
+                        exported,
                         count(Status::Failed)
                     ));
                 });
@@ -548,21 +828,29 @@ impl eframe::App for App {
             self.store_edits();
             self.editors.retain(|e| e.open);
         }
+
+        if self.last_autosave.elapsed() >= Duration::from_secs(1) {
+            self.last_autosave = Instant::now();
+            self.autosave();
+        }
+        // Автоматичното записване се проверява поне веднъж на 2 секунди.
+        ctx.request_repaint_after(Duration::from_secs(2));
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        self.store_edits();
+        self.autosave();
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_all();
+        self.autosave();
     }
 }
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]).with_min_inner_size([800.0, 400.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 760.0]).with_min_inner_size([800.0, 400.0]),
         ..Default::default()
     };
     eframe::run_native("PP Downloader", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))

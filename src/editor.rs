@@ -100,6 +100,9 @@ pub struct EditState {
     /// Краят е изключващ: последният кадър в експорта е out_t − 1 кадър.
     pub out_t: f64,
     pub masks: Vec<Mask>,
+    /// Последният експорт — за корекции се предлага същото име.
+    #[serde(default)]
+    pub exported: Option<PathBuf>,
 }
 
 /// Какво чертае влаченето в картината.
@@ -133,6 +136,8 @@ pub struct Editor {
     name: String,
     ffmpeg: PathBuf,
     crf: u32,
+    /// Папка по подразбиране за първия експорт (Готови в проекта).
+    export_dir: PathBuf,
     info: Info,
     pw: usize,
     ph: usize,
@@ -177,6 +182,7 @@ impl Editor {
         crf: u32,
         saved: Option<EditState>,
         marks: Option<(f64, f64)>,
+        export_dir: PathBuf,
         ctx: &egui::Context,
     ) -> Result<Self, String> {
         let info = media::probe(&ffmpeg, &path)?;
@@ -189,7 +195,7 @@ impl Editor {
         let fl = 1.0 / info.fps;
         let mut state = saved.unwrap_or_else(|| {
             let (a, b) = marks.unwrap_or((0.0, info.duration));
-            EditState { in_t: a, out_t: b, masks: Vec::new() }
+            EditState { in_t: a, out_t: b, masks: Vec::new(), exported: None }
         });
         state.in_t = snap(state.in_t, info.fps).clamp(0.0, (info.duration - fl).max(0.0));
         state.out_t = snap(state.out_t, info.fps).min(info.duration).max(state.in_t + fl);
@@ -219,6 +225,7 @@ impl Editor {
             name,
             ffmpeg,
             crf,
+            export_dir,
             pw,
             ph,
             playhead: state.in_t,
@@ -748,6 +755,9 @@ impl Editor {
             self.start_export(ui.ctx());
         }
         if let Some(p) = done {
+            if self.state.exported.as_ref() != Some(&p) {
+                self.state.exported = Some(p.clone());
+            }
             if ui.small_button("Покажи файла").clicked() {
                 crate::show_in_explorer(&p);
             }
@@ -761,11 +771,19 @@ impl Editor {
         if self.playing {
             self.pause();
         }
-        let dir = self.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        // Корекция на вече експортиран клип: предлага същото име и папка.
+        let (dir, file) = match &self.state.exported {
+            Some(prev) => (
+                prev.parent().map(Path::to_path_buf).unwrap_or_else(|| self.export_dir.clone()),
+                prev.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            ),
+            None => (self.export_dir.clone(), format!("{}.mp4", clean_name(&self.name))),
+        };
+        let _ = std::fs::create_dir_all(&dir);
         let Some(out) = rfd::FileDialog::new()
             .set_title("Експорт — име на готовия файл")
             .set_directory(&dir)
-            .set_file_name(format!("{}.mp4", clean_name(&self.name)))
+            .set_file_name(file)
             .add_filter("MP4 видео", &["mp4"])
             .save_file()
         else {
