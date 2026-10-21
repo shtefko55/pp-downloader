@@ -664,7 +664,10 @@ impl Editor {
     fn toolbar_ui(&mut self, ui: &mut egui::Ui) {
         let fl = self.frame_len();
         ui.add_space(6.0);
+        let transport_id = egui::Id::new(("transport", self.viewport));
+        let marks_id = egui::Id::new(("marks", self.viewport));
         ui.horizontal(|ui| {
+            let x0 = center_start(ui, transport_id);
             if ui.button("⏮").on_hover_text("Към IN (Home)").clicked() {
                 self.seek(self.state.in_t);
             }
@@ -687,11 +690,13 @@ impl Editor {
             ui.separator();
             ui.label(egui::RichText::new(self.tc(self.playhead)).monospace().size(20.0).strong());
             ui.weak(format!("/ {}", self.tc(self.info.duration)));
+            center_end(ui, transport_id, x0);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.export_ui(ui));
         });
         ui.add_space(2.0);
         ui.horizontal(|ui| {
+            let x0 = center_start(ui, marks_id);
             ui.label(egui::RichText::new("IN").color(IN_COLOR).strong());
             ui.monospace(self.tc(self.state.in_t));
             if ui.small_button("−1").on_hover_text("IN един кадър назад").clicked() {
@@ -721,6 +726,7 @@ impl Editor {
             }
             ui.separator();
             ui.label(format!("Дължина: {}", self.tc(self.state.out_t - self.state.in_t)));
+            center_end(ui, marks_id, x0);
         });
         ui.add_space(4.0);
     }
@@ -1031,6 +1037,22 @@ impl Editor {
 
 fn snap(t: f64, fps: f64) -> f64 {
     (t * fps).round() / fps
+}
+
+/// Центриране на група в хоризонтален ред: отстъп по ширината от предишния кадър.
+fn center_start(ui: &mut egui::Ui, id: egui::Id) -> f32 {
+    let width: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+    ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+    ui.cursor().min.x
+}
+
+fn center_end(ui: &mut egui::Ui, id: egui::Id, x0: f32) {
+    let width = ui.cursor().min.x - ui.spacing().item_spacing.x - x0;
+    let old: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+    if (width - old).abs() > 0.5 {
+        ui.data_mut(|d| d.insert_temp(id, width));
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+    }
 }
 
 /// [x0, y0, x1, y1]
