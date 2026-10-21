@@ -132,7 +132,7 @@ mod tests {
         assert!(audio.peak_max > 0.05 && audio.peaks.len() > 700);
 
         // Маска върху лявата половина на кадъра.
-        let mask = Mask { points: vec![[0.05, 0.1], [0.45, 0.1], [0.45, 0.9], [0.05, 0.9]], offset: [0.0, 0.0], scale: 1.0, blur: 30.0, feather: 6.0 };
+        let mask = Mask { kind: crate::editor::Kind::Ellipse, points: vec![[0.05, 0.1], [0.45, 0.1], [0.45, 0.9], [0.05, 0.9]], offset: [0.0, 0.0], scale: 1.0, blur: 30.0, feather: 6.0 };
         let out = dir.join("Моят откъс.mp4");
         let job = ExportJob {
             ffmpeg: ff.clone(),

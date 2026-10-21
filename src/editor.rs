@@ -14,9 +14,29 @@ const IN_COLOR: Color32 = Color32::from_rgb(70, 200, 110);
 const OUT_COLOR: Color32 = Color32::from_rgb(230, 90, 80);
 const PREVIEW_MAX_W: usize = 960;
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
+pub enum Kind {
+    #[default]
+    Lasso,
+    Rect,
+    Ellipse,
+}
+
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Lasso => "Ласо",
+            Kind::Rect => "Правоъгълник",
+            Kind::Ellipse => "Кръг",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Mask {
-    /// Контур от ласото, нормализиран 0..1 спрямо кадъра.
+    #[serde(default)]
+    pub kind: Kind,
+    /// Контурът (ласо, правоъгълник или кръг като многоъгълник), нормализиран 0..1 спрямо кадъра.
     pub points: Vec<[f32; 2]>,
     pub offset: [f32; 2],
     pub scale: f32,
@@ -27,8 +47,32 @@ pub struct Mask {
 }
 
 impl Mask {
-    fn new(points: Vec<[f32; 2]>) -> Self {
-        Mask { points, offset: [0.0, 0.0], scale: 1.0, blur: 25.0, feather: 8.0 }
+    fn new(kind: Kind, points: Vec<[f32; 2]>) -> Self {
+        Mask { kind, points, offset: [0.0, 0.0], scale: 1.0, blur: 25.0, feather: 8.0 }
+    }
+
+    /// Правоъгълник или елипса, вписани в кутията между два ъгъла.
+    fn shape_points(kind: Kind, a: [f32; 2], b: [f32; 2]) -> Vec<[f32; 2]> {
+        let (x0, x1, y0, y1) = (a[0].min(b[0]), a[0].max(b[0]), a[1].min(b[1]), a[1].max(b[1]));
+        match kind {
+            Kind::Ellipse => {
+                let (cx, cy, rx, ry) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0) / 2.0, (y1 - y0) / 2.0);
+                (0..72)
+                    .map(|i| {
+                        let t = i as f32 / 72.0 * std::f32::consts::TAU;
+                        [cx + rx * t.cos(), cy + ry * t.sin()]
+                    })
+                    .collect()
+            }
+            _ => vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+        }
+    }
+
+    /// Записва мащаба и преместването директно в точките.
+    fn bake(&mut self) {
+        self.points = self.effective();
+        self.offset = [0.0, 0.0];
+        self.scale = 1.0;
     }
 
     /// Контурът след мащаб (около центъра) и преместване.
@@ -56,6 +100,21 @@ pub struct EditState {
     /// Краят е изключващ: последният кадър в експорта е out_t − 1 кадър.
     pub out_t: f64,
     pub masks: Vec<Mask>,
+}
+
+/// Какво чертае влаченето в картината.
+#[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    Select,
+    Draw(Kind),
+}
+
+/// Преоразмеряване с точка: маска, точка (0..8), кутия и точки в началото.
+struct Resize {
+    mask: usize,
+    handle: usize,
+    start_box: [f32; 4],
+    start_points: Vec<[f32; 2]>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -95,9 +154,11 @@ pub struct Editor {
     shown_key: String,
 
     selected: Option<usize>,
-    lasso_mode: bool,
-    lasso: Vec<[f32; 2]>,
+    tool: Tool,
+    /// Чертаната в момента форма (ласо: всички точки; правоъгълник/кръг: двата ъгъла).
+    draft: Vec<[f32; 2]>,
     moving: bool,
+    resize: Option<Resize>,
     show_blur: bool,
     show_outlines: bool,
     mask_cache: Vec<Option<(Mask, Alpha)>>,
@@ -179,9 +240,10 @@ impl Editor {
             texture: None,
             shown_key: String::new(),
             selected: None,
-            lasso_mode: false,
-            lasso: Vec::new(),
+            tool: Tool::Select,
+            draft: Vec::new(),
             moving: false,
+            resize: None,
             show_blur: true,
             show_outlines: true,
             mask_cache: Vec::new(),
@@ -204,11 +266,14 @@ impl Editor {
             self.tick(ctx);
             self.keys(ctx);
             self.update_texture(ctx);
-            egui::TopBottomPanel::top(egui::Id::new(("ed_top", id))).show(ctx, |ui| self.toolbar_ui(ui));
             egui::SidePanel::right(egui::Id::new(("ed_side", id)))
                 .exact_width(300.0)
                 .show(ctx, |ui| self.masks_ui(ui));
-            egui::TopBottomPanel::bottom(egui::Id::new(("ed_timeline", id))).show(ctx, |ui| self.timeline_ui(ui));
+            // Бутоните и таймкодовете стоят точно над waveform-а.
+            egui::TopBottomPanel::bottom(egui::Id::new(("ed_timeline", id))).show(ctx, |ui| {
+                self.toolbar_ui(ui);
+                self.timeline_ui(ui);
+            });
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(Color32::from_gray(12)))
                 .show(ctx, |ui| self.preview_ui(ui));
@@ -396,8 +461,8 @@ impl Editor {
             }
         }
         if esc {
-            self.lasso_mode = false;
-            self.lasso.clear();
+            self.tool = Tool::Select;
+            self.draft.clear();
         }
     }
 
@@ -448,80 +513,149 @@ impl Editor {
         let to_screen = |q: &[f32; 2]| pos2(rect.min.x + q[0] * rect.width(), rect.min.y + q[1] * rect.height());
         let hit = |masks: &[Mask], p: Pos2| masks.iter().rposition(|m| point_in_poly(to_norm(p), &m.effective()));
 
-        if self.lasso_mode {
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+        // Точката за преоразмеряване на избраната маска под курсора.
+        let handle_at = |masks: &[Mask], sel: Option<usize>, p: Pos2| {
+            let b = bbox(&masks.get(sel?)?.effective());
+            (0..8).find(|&h| to_screen(&handle_pos(b, h)).distance(p) <= 8.0)
+        };
+        let shift = ui.input(|i| i.modifiers.shift);
+        // Ъгъл на правоъгълник/кръг; със Shift — квадрат/кръг (равни страни в пиксели).
+        let corner = |a: Pos2, p: Pos2| {
+            if !shift {
+                return p;
             }
-            if resp.drag_started() {
-                self.lasso.clear();
-                if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
-                    self.lasso.push(to_norm(p));
+            let d = p - a;
+            let s = d.x.abs().max(d.y.abs());
+            a + vec2(s * d.x.signum(), s * d.y.signum())
+        };
+
+        match self.tool {
+            Tool::Draw(kind) => {
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
                 }
-            }
-            if resp.dragged() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let far = self.lasso.last().map_or(true, |l| to_screen(l).distance(p) > 3.0);
-                    if far {
-                        self.lasso.push(to_norm(p));
+                let origin = ui.input(|i| i.pointer.press_origin());
+                if resp.drag_started() {
+                    self.draft.clear();
+                    if let Some(p) = origin {
+                        self.draft.push(to_norm(p));
                     }
                 }
-            }
-            if resp.drag_stopped() {
-                if self.lasso.len() >= 3 {
-                    self.state.masks.push(Mask::new(std::mem::take(&mut self.lasso)));
-                    self.selected = Some(self.state.masks.len() - 1);
+                if resp.dragged() {
+                    if let (Some(p), Some(o)) = (resp.interact_pointer_pos(), origin) {
+                        if kind == Kind::Lasso {
+                            if self.draft.last().map_or(true, |l| to_screen(l).distance(p) > 3.0) {
+                                self.draft.push(to_norm(p));
+                            }
+                        } else {
+                            self.draft.truncate(1);
+                            self.draft.push(to_norm(corner(o, p)));
+                        }
+                    }
                 }
-                self.lasso.clear();
-                self.lasso_mode = false;
-            }
-        } else {
-            if resp.clicked() {
-                self.selected = resp.interact_pointer_pos().and_then(|p| hit(&self.state.masks, p));
-            }
-            if resp.drag_started() {
-                let origin = ui.input(|i| i.pointer.press_origin());
-                let h = origin.and_then(|p| hit(&self.state.masks, p));
-                self.moving = h.is_some();
-                if h.is_some() {
-                    self.selected = h;
+                if resp.drag_stopped() {
+                    let points = match kind {
+                        Kind::Lasso if self.draft.len() >= 3 => Some(std::mem::take(&mut self.draft)),
+                        Kind::Rect | Kind::Ellipse if self.draft.len() == 2 => {
+                            let (a, b) = (to_screen(&self.draft[0]), to_screen(&self.draft[1]));
+                            ((a.x - b.x).abs() > 4.0 && (a.y - b.y).abs() > 4.0)
+                                .then(|| Mask::shape_points(kind, self.draft[0], self.draft[1]))
+                        }
+                        _ => None,
+                    };
+                    if let Some(points) = points {
+                        self.state.masks.push(Mask::new(kind, points));
+                        self.selected = Some(self.state.masks.len() - 1);
+                    }
+                    self.draft.clear();
+                    self.tool = Tool::Select;
                 }
             }
-            if resp.dragged() && self.moving {
-                if let Some(m) = self.selected.and_then(|i| self.state.masks.get_mut(i)) {
-                    let d = resp.drag_delta();
-                    m.offset[0] += d.x / rect.width();
-                    m.offset[1] += d.y / rect.height();
+            Tool::Select => {
+                if resp.clicked() {
+                    self.selected = resp.interact_pointer_pos().and_then(|p| hit(&self.state.masks, p));
                 }
-                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-            } else if resp.hover_pos().is_some_and(|p| hit(&self.state.masks, p).is_some()) {
-                ui.ctx().set_cursor_icon(CursorIcon::Grab);
-            }
-            if resp.drag_stopped() {
-                self.moving = false;
+                if resp.drag_started() {
+                    let origin = ui.input(|i| i.pointer.press_origin());
+                    if let Some((i, h)) = origin.and_then(|p| Some((self.selected?, handle_at(&self.state.masks, self.selected, p)?))) {
+                        let m = &mut self.state.masks[i];
+                        m.bake();
+                        self.resize = Some(Resize { mask: i, handle: h, start_box: bbox(&m.points), start_points: m.points.clone() });
+                    } else {
+                        let h = origin.and_then(|p| hit(&self.state.masks, p));
+                        self.moving = h.is_some();
+                        if h.is_some() {
+                            self.selected = h;
+                        }
+                    }
+                }
+                if resp.dragged() {
+                    if let Some(r) = &self.resize {
+                        if let (Some(p), Some(m)) = (resp.interact_pointer_pos(), self.state.masks.get_mut(r.mask)) {
+                            let nb = resized_box(r.start_box, r.handle, to_norm(p));
+                            m.points = remap(&r.start_points, r.start_box, nb);
+                        }
+                        ui.ctx().set_cursor_icon(handle_cursor(r.handle));
+                    } else if self.moving {
+                        if let Some(m) = self.selected.and_then(|i| self.state.masks.get_mut(i)) {
+                            let d = resp.drag_delta();
+                            m.offset[0] += d.x / rect.width();
+                            m.offset[1] += d.y / rect.height();
+                        }
+                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                    }
+                } else if let Some(p) = resp.hover_pos() {
+                    if let Some(h) = handle_at(&self.state.masks, self.selected, p) {
+                        ui.ctx().set_cursor_icon(handle_cursor(h));
+                    } else if hit(&self.state.masks, p).is_some() {
+                        ui.ctx().set_cursor_icon(CursorIcon::Grab);
+                    }
+                }
+                if resp.drag_stopped() {
+                    self.moving = false;
+                    self.resize = None;
+                }
             }
         }
 
         let painter = painter.with_clip_rect(rect);
+        let cyan = Color32::from_rgb(0, 220, 255);
         for (i, m) in self.state.masks.iter().enumerate() {
             let sel = self.selected == Some(i);
             if !(self.show_outlines || sel) {
                 continue;
             }
-            let pts: Vec<Pos2> = m.effective().iter().map(to_screen).collect();
+            let eff = m.effective();
+            let pts: Vec<Pos2> = eff.iter().map(to_screen).collect();
             let stroke = if sel { Stroke::new(2.0_f32, Color32::YELLOW) } else { Stroke::new(1.0_f32, Color32::from_white_alpha(170)) };
             painter.add(Shape::closed_line(pts, stroke));
+            if sel {
+                let b = bbox(&eff);
+                let frame = Rect::from_min_max(to_screen(&[b[0], b[1]]), to_screen(&[b[2], b[3]]));
+                painter.rect_stroke(frame, 0.0, Stroke::new(1.0_f32, Color32::from_white_alpha(90)));
+                for h in 0..8 {
+                    let c = to_screen(&handle_pos(b, h));
+                    painter.rect_filled(Rect::from_center_size(c, vec2(9.0, 9.0)), 1.0, Color32::WHITE);
+                    painter.rect_stroke(Rect::from_center_size(c, vec2(9.0, 9.0)), 1.0, Stroke::new(1.0_f32, Color32::BLACK));
+                }
+            }
         }
-        if self.lasso.len() >= 2 {
-            painter.add(Shape::line(self.lasso.iter().map(to_screen).collect(), Stroke::new(2.0_f32, Color32::from_rgb(0, 220, 255))));
+        match self.tool {
+            Tool::Draw(Kind::Lasso) if self.draft.len() >= 2 => {
+                painter.add(Shape::line(self.draft.iter().map(to_screen).collect(), Stroke::new(2.0_f32, cyan)));
+            }
+            Tool::Draw(kind) if self.draft.len() == 2 => {
+                let pts = Mask::shape_points(kind, self.draft[0], self.draft[1]);
+                painter.add(Shape::closed_line(pts.iter().map(to_screen).collect(), Stroke::new(2.0_f32, cyan)));
+            }
+            _ => {}
         }
-        if self.lasso_mode {
-            painter.text(
-                rect.min + vec2(12.0, 12.0),
-                egui::Align2::LEFT_TOP,
-                "Ласо: задръж левия бутон и очертай обекта (Esc = отказ)",
-                egui::FontId::proportional(16.0),
-                Color32::from_rgb(0, 220, 255),
-            );
+        if let Tool::Draw(kind) = self.tool {
+            let hint = match kind {
+                Kind::Lasso => "Ласо: задръж левия бутон и очертай обекта (Esc = отказ)",
+                _ => "Натисни, задръж и влачи. Shift = квадрат/кръг (Esc = отказ)",
+            };
+            painter.text(rect.min + vec2(12.0, 12.0), egui::Align2::LEFT_TOP, hint, egui::FontId::proportional(16.0), cyan);
         }
     }
 
@@ -676,16 +810,23 @@ impl Editor {
         ui.add_space(8.0);
         ui.heading("Blur маски");
         ui.add_space(4.0);
-        let label = if self.lasso_mode { "✖  Откажи ласото" } else { "✏  Нова маска (ласо)" };
-        if ui.add(crate::colored_button(label, crate::PURPLE).min_size(vec2(ui.available_width(), 32.0))).clicked() {
-            self.lasso_mode = !self.lasso_mode;
-            self.lasso.clear();
-            if self.playing {
-                self.pause();
-                self.seek(self.playhead);
+        ui.label("Нова маска:");
+        let w = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
+        ui.horizontal(|ui| {
+            for (kind, label) in [(Kind::Rect, "▭ Правоъг."), (Kind::Ellipse, "○ Кръг"), (Kind::Lasso, "✏ Ласо")] {
+                let active = self.tool == Tool::Draw(kind);
+                let fill = if active { Color32::from_rgb(0, 150, 190) } else { crate::PURPLE };
+                if ui.add(crate::colored_button(label, fill).min_size(vec2(w, 32.0))).clicked() {
+                    self.tool = if active { Tool::Select } else { Tool::Draw(kind) };
+                    self.draft.clear();
+                    if self.playing {
+                        self.pause();
+                        self.seek(self.playhead);
+                    }
+                }
             }
-        }
-        ui.weak("Очертай обекта в картината. Влачи маската, за да я преместиш. Delete изтрива избраната.");
+        });
+        ui.weak("Избери форма, после натисни, задръж и влачи в картината. Маската се мести с влачене, а размерът се сменя от белите точки. Delete изтрива избраната.");
         ui.checkbox(&mut self.show_blur, "Покажи blur в прегледа");
         ui.checkbox(&mut self.show_outlines, "Покажи контурите на всички маски");
         ui.separator();
@@ -701,7 +842,7 @@ impl Editor {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        if ui.selectable_label(sel, egui::RichText::new(format!("Маска {}", i + 1)).strong()).clicked() {
+                        if ui.selectable_label(sel, egui::RichText::new(format!("{} {}", self.state.masks[i].kind.label(), i + 1)).strong()).clicked() {
                             self.selected = if sel { None } else { Some(i) };
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -715,7 +856,7 @@ impl Editor {
                     });
                     if sel {
                         let m = &mut self.state.masks[i];
-                        ui.add(egui::Slider::new(&mut m.scale, 0.2..=3.0).text("Размер").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                        ui.add(egui::Slider::new(&mut m.scale, 0.2..=3.0).text("Мащаб").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
                         ui.add(egui::Slider::new(&mut m.blur, 1.0..=120.0).text("Blur").integer());
                         ui.add(egui::Slider::new(&mut m.feather, 0.0..=80.0).text("Feather").integer());
                         if ui.small_button("Върни позиция и размер").clicked() {
@@ -892,6 +1033,61 @@ fn snap(t: f64, fps: f64) -> f64 {
     (t * fps).round() / fps
 }
 
+/// [x0, y0, x1, y1]
+fn bbox(pts: &[[f32; 2]]) -> [f32; 4] {
+    pts.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, p| [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])])
+}
+
+/// Точки за размер: 0 горе-ляво, после по часовниковата стрелка; 7 = ляво.
+fn handle_pos(b: [f32; 4], h: usize) -> [f32; 2] {
+    let (xm, ym) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+    match h {
+        0 => [b[0], b[1]],
+        1 => [xm, b[1]],
+        2 => [b[2], b[1]],
+        3 => [b[2], ym],
+        4 => [b[2], b[3]],
+        5 => [xm, b[3]],
+        6 => [b[0], b[3]],
+        _ => [b[0], ym],
+    }
+}
+
+fn handle_cursor(h: usize) -> CursorIcon {
+    match h {
+        0 | 4 => CursorIcon::ResizeNwSe,
+        2 | 6 => CursorIcon::ResizeNeSw,
+        1 | 5 => CursorIcon::ResizeVertical,
+        _ => CursorIcon::ResizeHorizontal,
+    }
+}
+
+/// Кутията след влачене на точка `h` до `p`; страните не могат да се разминат.
+fn resized_box(b: [f32; 4], h: usize, p: [f32; 2]) -> [f32; 4] {
+    const MIN: f32 = 0.01;
+    let mut n = b;
+    if matches!(h, 0 | 6 | 7) {
+        n[0] = p[0].min(b[2] - MIN);
+    }
+    if matches!(h, 2 | 3 | 4) {
+        n[2] = p[0].max(b[0] + MIN);
+    }
+    if matches!(h, 0 | 1 | 2) {
+        n[1] = p[1].min(b[3] - MIN);
+    }
+    if matches!(h, 4 | 5 | 6) {
+        n[3] = p[1].max(b[1] + MIN);
+    }
+    n
+}
+
+/// Пренася точките от кутия `from` в кутия `to`.
+fn remap(pts: &[[f32; 2]], from: [f32; 4], to: [f32; 4]) -> Vec<[f32; 2]> {
+    let sx = (to[2] - to[0]) / (from[2] - from[0]).max(1e-6);
+    let sy = (to[3] - to[1]) / (from[3] - from[1]).max(1e-6);
+    pts.iter().map(|p| [to[0] + (p[0] - from[0]) * sx, to[1] + (p[1] - from[1]) * sy]).collect()
+}
+
 fn point_in_poly(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
     let mut inside = false;
     let mut j = poly.len().wrapping_sub(1);
@@ -910,5 +1106,46 @@ fn clean_name(stem: &str) -> String {
     match stem.rfind(" [") {
         Some(i) if stem.ends_with(']') => stem[..i].trim().to_string(),
         _ => stem.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shapes_and_handles() {
+        let rect = Mask::shape_points(Kind::Rect, [0.6, 0.5], [0.2, 0.1]);
+        assert_eq!(bbox(&rect), [0.2, 0.1, 0.6, 0.5]);
+        let ell = Mask::shape_points(Kind::Ellipse, [0.2, 0.2], [0.4, 0.6]);
+        let b = bbox(&ell);
+        assert!((b[0] - 0.2).abs() < 1e-3 && (b[3] - 0.6).abs() < 1e-3);
+        assert!(point_in_poly([0.3, 0.4], &ell) && !point_in_poly([0.21, 0.21], &ell));
+
+        // Долният десен ъгъл (4) разширява кутията; горният ляв не мърда.
+        let nb = resized_box([0.2, 0.1, 0.6, 0.5], 4, [0.8, 0.9]);
+        assert_eq!(nb, [0.2, 0.1, 0.8, 0.9]);
+        let moved = remap(&rect, [0.2, 0.1, 0.6, 0.5], nb);
+        assert_eq!(bbox(&moved), nb);
+        // Лявата страна (7) не може да мине вдясно от дясната.
+        let nb = resized_box([0.2, 0.1, 0.6, 0.5], 7, [0.9, 0.3]);
+        assert!(nb[0] < nb[2] && nb[1] == 0.1 && nb[3] == 0.5);
+
+        // bake запазва видимия контур.
+        let mut m = Mask::new(Kind::Rect, rect.clone());
+        m.scale = 2.0;
+        m.offset = [0.1, 0.0];
+        let before = m.effective();
+        m.bake();
+        assert_eq!(m.points, before);
+        let close = |a: &[[f32; 2]], b: &[[f32; 2]]| a.iter().zip(b).all(|(p, q)| (p[0] - q[0]).abs() < 1e-5 && (p[1] - q[1]).abs() < 1e-5);
+        assert!(close(&m.effective(), &before));
+    }
+
+    #[test]
+    fn old_masks_still_load() {
+        let old = r#"{"in_t":1.0,"out_t":2.0,"masks":[{"points":[[0.1,0.1],[0.2,0.1],[0.2,0.2]],"offset":[0.0,0.0],"scale":1.0,"blur":25.0,"feather":8.0}]}"#;
+        let s: EditState = serde_json::from_str(old).unwrap();
+        assert_eq!(s.masks[0].kind, Kind::Lasso);
     }
 }
