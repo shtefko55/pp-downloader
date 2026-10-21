@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
 /// GitHub хранилището с версиите (owner/repo).
-pub const REPO: &str = "OWNER/pp-downloader";
+pub const REPO: &str = "shtefko55/pp-downloader";
 pub const ASSET: &str = "PP_Downloader.exe";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
