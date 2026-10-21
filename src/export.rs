@@ -86,7 +86,7 @@ pub fn run(job: &ExportJob, cancel: &AtomicBool, on_progress: impl Fn(f32)) -> R
     let mut part = job.out.clone().into_os_string();
     part.push(".part");
     let part = PathBuf::from(part);
-    cmd.args(["-c:v", "libx264", "-preset", "slow", "-crf"])
+    cmd.args(["-c:v", "libx264", "-preset", "medium", "-crf"])
         .arg(job.crf.to_string())
         .args(["-pix_fmt", "yuv420p", "-profile:v", "high", "-movflags", "+faststart", "-f", "mp4"])
         .arg(&part);

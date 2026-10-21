@@ -349,8 +349,12 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
     };
     for &i in &used {
         let s = &streams[i];
-        if s.url.starts_with("http") && !s.headers.is_empty() {
-            cmd.arg("-headers").arg(&s.headers);
+        if s.url.starts_with("http") {
+            if !s.headers.is_empty() {
+                cmd.arg("-headers").arg(&s.headers);
+            }
+            // Заявки по 10 MB: YouTube бави една дълга заявка до ~0.6 MB/s.
+            cmd.args(["-request_size", "10000000"]);
         }
         cmd.arg("-ss").arg(format!("{start:.3}")).arg("-t").arg(format!("{dur:.3}")).arg("-i").arg(&s.url);
     }
@@ -363,7 +367,7 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
     if copy_video {
         cmd.args(["-c:v", "copy", "-avoid_negative_ts", "make_zero"]);
     } else {
-        cmd.args(["-c:v", "libx264", "-preset", "slow", "-crf"])
+        cmd.args(["-c:v", "libx264", "-preset", "medium", "-crf"])
             .arg(task.opts.crf.to_string())
             .args(["-pix_fmt", "yuv420p", "-profile:v", "high", "-g"])
             // Ключов кадър всяка секунда — по-бързо превъртане в редактора.
