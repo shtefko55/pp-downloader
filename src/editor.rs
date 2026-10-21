@@ -260,6 +260,10 @@ impl Editor {
         })
     }
 
+    pub fn exporting(&self) -> bool {
+        self.export.lock().unwrap().running
+    }
+
     pub fn show(&mut self, ctx: &egui::Context) {
         let builder = egui::ViewportBuilder::default()
             .with_title(format!("Редакция — {}", self.name))

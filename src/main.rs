@@ -5,6 +5,7 @@ mod editor;
 mod export;
 mod media;
 mod project;
+mod updater;
 mod worker;
 
 use eframe::egui;
@@ -121,6 +122,7 @@ struct App {
     active: Arc<AtomicUsize>,
     cancel: Arc<AtomicBool>,
     update_msg: Arc<Mutex<String>>,
+    app_update: Arc<Mutex<updater::UpdateState>>,
     scroll_to_add: bool,
 }
 
@@ -198,9 +200,12 @@ impl App {
             active: Default::default(),
             cancel: Default::default(),
             update_msg: Default::default(),
+            app_update: Default::default(),
             scroll_to_add: false,
         };
         app.project_opened();
+        updater::cleanup();
+        app.check_for_update(&cc.egui_ctx);
         // Видео, пуснато върху PP_Downloader.exe, се отваря направо в редактора.
         if let Some(file) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
             app.open_file(file, &cc.egui_ctx);
@@ -238,6 +243,77 @@ impl App {
         self.saved.recent.truncate(12);
         self.saved.current = Some(path);
         self.last_json = self.project.to_json();
+    }
+
+    fn check_for_update(&self, ctx: &egui::Context) {
+        let (state, ctx) = (self.app_update.clone(), ctx.clone());
+        *state.lock().unwrap() = updater::UpdateState::Checking;
+        std::thread::spawn(move || {
+            let result = updater::check().unwrap_or_else(updater::UpdateState::Failed);
+            *state.lock().unwrap() = result;
+            ctx.request_repaint();
+        });
+    }
+
+    /// Бутонът за обновяване на програмата (долу вдясно).
+    fn app_update_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        use updater::UpdateState as U;
+        let state = self.app_update.lock().unwrap().clone();
+        match state {
+            U::Idle | U::UpToDate | U::Failed(_) => {
+                if ui.add(colored_button("⟳ Провери за обновяване", SLATE).min_size(egui::vec2(0.0, 32.0))).clicked() {
+                    self.check_for_update(ctx);
+                }
+                match state {
+                    U::UpToDate => {
+                        ui.colored_label(egui::Color32::from_rgb(40, 170, 80), "✔ Последна версия");
+                    }
+                    U::Failed(e) => {
+                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), "✖ Проверката не успя").on_hover_text(e);
+                    }
+                    _ => {}
+                }
+            }
+            U::Checking => {
+                ui.spinner();
+                ui.weak("Проверка за нова версия…");
+            }
+            U::Available { version, url, notes } => {
+                let busy = self.busy() || self.editors.iter().any(|e| e.exporting());
+                let button = colored_button(&format!("⬇ Обнови до v{version}"), GREEN).min_size(egui::vec2(0.0, 32.0));
+                let hover = if busy {
+                    "Изчакай свалянето/експорта да приключи.".to_string()
+                } else if notes.is_empty() {
+                    "Програмата ще се затвори и отвори отново с новата версия. Проектът се записва автоматично.".to_string()
+                } else {
+                    format!("Какво е новото:\n{notes}")
+                };
+                if ui.add_enabled(!busy, button).on_hover_text(&hover).on_disabled_hover_text(&hover).clicked() {
+                    let (state, ctx) = (self.app_update.clone(), ctx.clone());
+                    *state.lock().unwrap() = U::Downloading;
+                    std::thread::spawn(move || {
+                        let result = match updater::install(&url) {
+                            Ok(exe) => U::Ready(exe),
+                            Err(e) => U::Failed(e),
+                        };
+                        *state.lock().unwrap() = result;
+                        ctx.request_repaint();
+                    });
+                }
+            }
+            U::Downloading => {
+                ui.spinner();
+                ui.weak("Изтегляне на новата версия…");
+            }
+            U::Ready(exe) => {
+                *self.app_update.lock().unwrap() = U::Idle;
+                self.store_edits();
+                self.autosave();
+                updater::restart(&exe);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        ui.weak(format!("v{}", updater::VERSION));
     }
 
     fn busy(&self) -> bool {
@@ -802,6 +878,8 @@ impl eframe::App for App {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.app_update_ui(ui, ctx);
+                    ui.separator();
                     let jobs = &self.project.jobs;
                     let count = |s: Status| jobs.iter().filter(|j| j.state.lock().unwrap().status == s).count();
                     let exported = jobs.iter().filter(|j| j.edit.as_ref().is_some_and(|e| e.exported.is_some())).count();
