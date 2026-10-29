@@ -921,13 +921,13 @@ impl App {
                 ui.add_enabled_ui(!busy, |ui| {
                     ui.horizontal(|ui| {
                         ui.strong(format!("{:>2}.", idx + 1));
-                        let w = (ui.available_width() - 330.0).max(200.0);
+                        let w = (ui.available_width() - 400.0).max(200.0);
                         let hint = if imported { "(видео от диска)" } else { "Линк (YouTube, bnt.bg …)" };
                         let r = ui.add(egui::TextEdit::singleline(&mut job.url).hint_text(hint).desired_width(w));
                         let pasted = edit_menu(&r, &mut job.url);
                         let n = ui.add(egui::TextEdit::singleline(&mut job.name).hint_text("Име на файла (по избор)").desired_width(200.0));
                         edit_menu(&n, &mut job.name);
-                        if ui.button("⧉").on_hover_text("Дублирай (същият линк, друг откъс)").clicked() {
+                        if ui.button("Дублирай").on_hover_text("Нов ред със същия линк — за следващ откъс").clicked() {
                             duplicate = Some(idx);
                         }
                         if ui.button("✖").on_hover_text("Премахни от проекта").clicked() {

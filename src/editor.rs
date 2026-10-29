@@ -1078,7 +1078,7 @@ impl Editor {
                             if ui.small_button("✖").on_hover_text("Изтрий").clicked() {
                                 remove = Some(i);
                             }
-                            if ui.small_button("⧉").on_hover_text("Дублирай").clicked() {
+                            if ui.small_button("Дублирай").on_hover_text("Копие на маската до нея").clicked() {
                                 duplicate = Some(i);
                             }
                         });
