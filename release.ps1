@@ -17,7 +17,7 @@ if (git status --porcelain) { throw "Има незаписани промени 
 
 cargo build --release
 if ($LASTEXITCODE) { throw "Компилацията не успя." }
-Copy-Item target\release\pp_downloader.exe PP_Downloader.exe -Force
+try { Copy-Item target\release\pp_downloader.exe PP_Downloader.exe -Force -ErrorAction Stop } catch { throw "PP_Downloader.exe не може да се замени (програмата е пусната от тази папка?) — затвори я и пусни пак." }
 
 $assets = @("PP_Downloader.exe")
 if ($Full) {
