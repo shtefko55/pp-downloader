@@ -154,6 +154,8 @@ struct App {
     update_msg: Arc<Mutex<String>>,
     app_update: Arc<Mutex<updater::UpdateState>>,
     scroll_to_add: bool,
+    /// Размерът на прозореца се проверява в първите кадри след пускане.
+    size_checks: u32,
 }
 
 const UNNAMED: &str = "Без име";
@@ -233,6 +235,7 @@ impl App {
             update_msg: Default::default(),
             app_update: Default::default(),
             scroll_to_add: false,
+            size_checks: 0,
         };
         app.project_opened();
         updater::cleanup();
@@ -1053,6 +1056,17 @@ impl eframe::App for App {
             self.cancel.store(false, Ordering::SeqCst);
         } else {
             worker::ensure_workers(&self.queue, &self.active, &self.cancel, self.saved.settings.parallel, &self.tools, ctx);
+        }
+
+        // Запомненият размер може да е миниатюрен (напр. затворен минимизиран) — тогава се връща нормалният.
+        if self.size_checks < 10 {
+            self.size_checks += 1;
+            let (inner, minimized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().minimized.unwrap_or(false)));
+            if !minimized && inner.is_some_and(|r| r.width() < 800.0 || r.height() < 400.0) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1100.0, 760.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(80.0, 60.0)));
+                self.size_checks = 10;
+            }
         }
 
         let title = format!("PP Downloader — {}", self.project.name);
