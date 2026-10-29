@@ -31,6 +31,8 @@ pub struct JobState {
     pub status: Status,
     pub progress: f32,
     pub info: String,
+    /// Подробен лог на свалянето — показва се при грешка (линк, настройки, стъпки, пълният текст).
+    pub log: String,
     pub output: Option<PathBuf>,
     /// Въведените начало и край спрямо началото на сваления клип (без handles).
     pub marks: (f64, f64),
@@ -146,7 +148,7 @@ pub(crate) fn run_bytes(mut cmd: Command, cancel: &AtomicBool) -> Result<Vec<u8>
     if status.success() {
         Ok(out)
     } else {
-        Err(tail(&err, 4))
+        Err(tail(&err, 15))
     }
 }
 
@@ -196,6 +198,19 @@ pub fn run_task(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
         st.status = Status::Working;
         st.progress = 0.0;
         st.info = "Анализ на линка…".into();
+        let o = &task.opts;
+        let mode = if o.precise { format!("Прецизно (CRF {})", o.crf) } else { "Бързо (копиране)".into() };
+        let res = if o.max_res == 0 { "най-добра".to_string() } else { format!("до {}p", o.max_res) };
+        st.log = format!(
+            "PP Downloader v{}\nВреме: {} UTC\nЛинк: {}\nИме: {}\nУчастък (с handles): {} – {}\nРежим: {mode}, резолюция {res}\nПапка: {}\n\n",
+            crate::updater::VERSION,
+            utc_now(),
+            task.url,
+            if task.name.trim().is_empty() { "(от заглавието)" } else { task.name.trim() },
+            fmt_secs(task.cut_start),
+            fmt_secs(task.cut_end),
+            o.out_dir.display(),
+        );
     }
     ctx.request_repaint();
     let result = process(task, tools, cancel, ctx);
@@ -214,11 +229,61 @@ pub fn run_task(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
         }
         Err(e) => {
             st.status = Status::Failed;
-            st.info = e;
+            st.info = short_error(&e);
+            st.log += &format!("ГРЕШКА:\n{e}\n");
+            drop(st);
+            let versions = tool_versions(tools);
+            task.state.lock().unwrap().log += &format!("\n{versions}");
+            ctx.request_repaint();
+            return;
         }
     }
     drop(st);
     ctx.request_repaint();
+}
+
+fn note(task: &Task, line: impl AsRef<str>) {
+    let mut st = task.state.lock().unwrap();
+    st.log += line.as_ref();
+    st.log.push('\n');
+}
+
+/// За реда в списъка: последните 3 реда, всеки до 200 знака (дългите линкове се съкращават).
+fn short_error(e: &str) -> String {
+    let lines: Vec<String> = e
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| if l.chars().count() > 200 { l.chars().take(200).chain(['…']).collect() } else { l.to_string() })
+        .collect();
+    lines[lines.len().saturating_sub(3)..].join("\n")
+}
+
+fn tool_versions(tools: &Tools) -> String {
+    let version = |tool: &Option<PathBuf>, arg: &str| {
+        let Some(t) = tool else { return "липсва".to_string() };
+        let mut c = command(t);
+        c.arg(arg);
+        run_capture(c, &AtomicBool::new(false)).map(|o| o.lines().next().unwrap_or("").trim().to_string()).unwrap_or_else(|e| e)
+    };
+    format!("yt-dlp: {}\nffmpeg: {}\n", version(&tools.ytdlp, "--version"), version(&tools.ffmpeg, "-version"))
+}
+
+/// „2026-10-29 08:15:03“ (UTC) — без външни библиотеки.
+fn utc_now() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Алгоритъм civil_from_days (H. Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", rem / 3600, rem / 60 % 60, rem % 60)
 }
 
 struct Stream {
@@ -256,6 +321,7 @@ fn process(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::egui::
     for attempt in 1.. {
         match process_once(task, tools, cancel, ctx) {
             Err(e) if attempt < ATTEMPTS && (e.contains("403") || e.contains("Forbidden")) => {
+                note(task, format!("Опит {attempt}: сървърът отказа (403):\n{e}\n"));
                 task.state.lock().unwrap().info = format!("Сървърът отказа (403), нов опит {}/{ATTEMPTS}…", attempt + 1);
                 ctx.request_repaint();
                 thread::sleep(Duration::from_secs(2));
@@ -299,6 +365,7 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
             })?;
             let info = resolve(yt, &media, &sort, Some(&task.url), cancel).map_err(|e| format!("{e}
 (видео от страницата: {media})"))?;
+            note(task, format!("yt-dlp не поддържа страницата — видео от HTML: {media} (бисквитка: {})", if cookie.is_empty() { "няма" } else { "да" }));
             (info, find_og_title(&html), cookie, media)
         }
         Err(e) => return Err(e),
@@ -398,6 +465,17 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
     // YouTube връща 403 за линковете от `yt-dlp -J`, когато ги отвори друга програма —
     // затова там участъкът го сваля самият yt-dlp (пак през ffmpeg, със същото кодиране).
     let is_youtube = info["extractor_key"].as_str().is_some_and(|k| k.starts_with("Youtube"));
+    note(
+        task,
+        format!(
+            "Източник: {} ({}), формат {}, {fmt_desc}, дължина {}\nСваляне: {}",
+            info["extractor_key"].as_str().unwrap_or("?"),
+            source,
+            info["format_id"].as_str().unwrap_or("?"),
+            duration.map_or("неизвестна".to_string(), |d| fmt_secs(d as u32)),
+            if is_youtube { "през yt-dlp (--download-sections)" } else { "директно с ffmpeg" }
+        ),
+    );
     let result = if is_youtube {
         let mut cmd = command(yt);
         cmd.args(["--no-playlist", "--no-warnings", "--newline", "--force-overwrites", "--encoding", "utf-8", "-f"])
@@ -515,7 +593,7 @@ fn run_ytdlp_download(mut cmd: Command, dur: f64, cancel: &AtomicBool, on_progre
     }
     // Най-полезни са редовете с ERROR от yt-dlp; иначе последните.
     let errors: Vec<&String> = last.iter().filter(|l| l.contains("ERROR") || l.contains("Error")).collect();
-    let text = if errors.is_empty() { tail(&Vec::from(last).join("\n"), 4) } else { errors.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n") };
+    let text = if errors.is_empty() { tail(&Vec::from(last).join("\n"), 15) } else { errors.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n") };
     Err(format!("yt-dlp: {text}"))
 }
 
@@ -675,7 +753,7 @@ pub(crate) fn run_ffmpeg(mut cmd: Command, dur: f64, cancel: &AtomicBool, on_pro
     if status.success() {
         Ok(())
     } else {
-        Err(format!("ffmpeg: {}", tail(&err, 4)))
+        Err(format!("ffmpeg: {}", tail(&err, 15)))
     }
 }
 
@@ -706,6 +784,38 @@ fn unique_path(dir: &Path, base: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_texts() {
+        let t = utc_now();
+        assert_eq!(t.len(), 19, "{t}");
+        assert!(t.as_str() >= "2026-01-01");
+        let long = format!("ред 1\nред 2\nError opening input file https://x/{}\nред 4", "a".repeat(500));
+        let short = short_error(&long);
+        assert_eq!(short.lines().count(), 3);
+        assert!(short.lines().all(|l| l.chars().count() <= 201));
+    }
+
+    /// Неуспешно сваляне: логът съдържа линка, настройките, грешката и версиите.
+    #[test]
+    #[ignore]
+    fn failed_download_log() {
+        let task = Task {
+            url: "https://www.youtube.com/watch?v=xxxxxxxxxxx".into(),
+            name: String::new(),
+            cut_start: 0,
+            cut_end: 10,
+            label: "fail".into(),
+            marks: (0.0, 10.0),
+            opts: Options { out_dir: std::env::temp_dir().join("pp_downloader_test"), precise: true, max_res: 0, crf: 16 },
+            state: Default::default(),
+        };
+        run_task(&task, &Tools::find(), &AtomicBool::new(false), &eframe::egui::Context::default());
+        let st = task.state.lock().unwrap();
+        println!("--- info ---\n{}\n--- log ---\n{}", st.info, st.log);
+        assert_eq!(st.status, Status::Failed);
+        assert!(st.log.contains(&task.url) && st.log.contains("ГРЕШКА") && st.log.contains("yt-dlp: 20"));
+    }
 
     #[test]
     fn cookies_from_curl_jar() {

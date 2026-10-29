@@ -73,6 +73,9 @@ struct Settings {
     precise: bool,
     max_res: u32,
     crf: u32,
+    /// Таймкодът се пише на ръка (иначе — падащи менюта).
+    #[serde(default)]
+    tc_typed: bool,
 }
 
 impl Default for Settings {
@@ -85,6 +88,7 @@ impl Default for Settings {
             precise: true,
             max_res: 0,
             crf: 16,
+            tc_typed: false,
         }
     }
 }
@@ -156,6 +160,8 @@ struct App {
     scroll_to_add: bool,
     /// Размерът на прозореца се проверява в първите кадри след пускане.
     size_checks: u32,
+    /// Отворен лог на грешка: (заглавие, текст).
+    log_view: Option<(String, String)>,
 }
 
 const UNNAMED: &str = "Без име";
@@ -236,6 +242,7 @@ impl App {
             app_update: Default::default(),
             scroll_to_add: false,
             size_checks: 0,
+            log_view: None,
         };
         app.project_opened();
         updater::cleanup();
@@ -487,12 +494,14 @@ impl App {
         let mut edit = None;
         let mut start = false;
         let mut to_project = false;
+        let mut show_log = None;
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("quick"), builder, |ctx, _| {
             if ctx.input(|i| i.viewport().close_requested()) {
                 self.quick.open = false;
                 self.quick.cancel.store(true, Ordering::SeqCst);
             }
             let handles = self.saved.settings.handles;
+            let typed = self.saved.settings.tc_typed;
             let editor_msg = self.editor_msg.clone();
             let q = &mut self.quick;
             let working = q.working();
@@ -509,13 +518,15 @@ impl App {
                         let mut changed = false;
                         ui.horizontal(|ui| {
                             let w = (ui.available_width() - 210.0).max(200.0);
-                            changed |= ui.add(egui::TextEdit::singleline(&mut q.url).hint_text("Линк (YouTube, bnt.bg …)").desired_width(w)).changed();
-                            ui.add(egui::TextEdit::singleline(&mut q.name).hint_text("Име на файла (по избор)").desired_width(200.0));
+                            let r = ui.add(egui::TextEdit::singleline(&mut q.url).hint_text("Линк (YouTube, bnt.bg …)").desired_width(w));
+                            changed |= r.changed() | edit_menu(&r, &mut q.url);
+                            let n = ui.add(egui::TextEdit::singleline(&mut q.name).hint_text("Име на файла (по избор)").desired_width(200.0));
+                            edit_menu(&n, &mut q.name);
                         });
                         ui.horizontal(|ui| {
-                            changed |= tc_ui(ui, ("qstart", 0), "Начало:", &mut q.start);
+                            changed |= tc_ui(ui, ("qstart", 0), "Начало:", &mut q.start, typed);
                             ui.add_space(16.0);
-                            changed |= tc_ui(ui, ("qend", 0), "Край:", &mut q.end);
+                            changed |= tc_ui(ui, ("qend", 0), "Край:", &mut q.end, typed);
                             ui.add_space(16.0);
                             let (a, b) = (q.start.secs(), q.end.secs());
                             if b > a {
@@ -571,6 +582,12 @@ impl App {
                     }
                     Status::Failed => {
                         ui.colored_label(egui::Color32::from_rgb(220, 60, 60), format!("✖ {info}"));
+                        let log = q.state.lock().unwrap().log.clone();
+                        ui.horizontal(|ui| {
+                            if let Some(log) = log_buttons(ui, log) {
+                                show_log = Some(("Единично сваляне".to_string(), log));
+                            }
+                        });
                     }
                     Status::Idle | Status::Cancelled => {
                         ui.weak(info);
@@ -586,6 +603,44 @@ impl App {
         }
         if to_project {
             self.quick_to_project();
+        }
+        if show_log.is_some() {
+            self.log_view = show_log;
+        }
+    }
+
+    /// Прозорец с подробния лог на грешка — за копиране и изпращане.
+    fn log_ui(&mut self, ctx: &egui::Context) {
+        let Some((title, log)) = &self.log_view else { return };
+        let builder = egui::ViewportBuilder::default()
+            .with_title(format!("Грешка — {title}"))
+            .with_inner_size([820.0, 520.0])
+            .with_min_inner_size([480.0, 300.0]);
+        let mut close = false;
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("error_log"), builder, |ctx, _| {
+            close = ctx.input(|i| i.viewport().close_requested());
+            egui::TopBottomPanel::bottom("log_actions").show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.add(colored_button("📋 Копирай целия лог", BLUE).min_size(egui::vec2(0.0, 30.0))).clicked() {
+                        ctx.copy_text(log.clone());
+                    }
+                    if ui.button("Затвори").clicked() {
+                        close = true;
+                    }
+                    ui.weak("Логът съдържа линка, настройките и пълния текст на грешката.");
+                });
+                ui.add_space(6.0);
+            });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    let mut text = log.as_str();
+                    ui.add(egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+                });
+            });
+        });
+        if close {
+            self.log_view = None;
         }
     }
 
@@ -831,11 +886,18 @@ impl App {
                 ui.add(egui::DragValue::new(&mut s.crf).range(10..=28))
                     .on_hover_text("По-малко = по-високо качество. 16 е практически без видима загуба.");
             }
+            ui.separator();
+            ui.label("Таймкод:");
+            ui.selectable_value(&mut s.tc_typed, false, "▼ Меню").on_hover_text("Часове, минути и секунди от падащи менюта");
+            ui.selectable_value(&mut s.tc_typed, true, "⌨ Ръчно")
+                .on_hover_text("Пишеш цифрите направо; 9 = 09. Tab минава към следващото поле.");
         });
     }
 
     fn jobs_ui(&mut self, ui: &mut egui::Ui) {
         let handles = self.saved.settings.handles;
+        let typed = self.saved.settings.tc_typed;
+        let mut show_log = None;
         let mut remove = None;
         let mut duplicate = None;
         let mut edit = None;
@@ -861,22 +923,24 @@ impl App {
                         let w = (ui.available_width() - 330.0).max(200.0);
                         let hint = if imported { "(видео от диска)" } else { "Линк (YouTube, bnt.bg …)" };
                         let r = ui.add(egui::TextEdit::singleline(&mut job.url).hint_text(hint).desired_width(w));
-                        ui.add(egui::TextEdit::singleline(&mut job.name).hint_text("Име на файла (по избор)").desired_width(200.0));
+                        let pasted = edit_menu(&r, &mut job.url);
+                        let n = ui.add(egui::TextEdit::singleline(&mut job.name).hint_text("Име на файла (по избор)").desired_width(200.0));
+                        edit_menu(&n, &mut job.name);
                         if ui.button("⧉").on_hover_text("Дублирай (същият линк, друг откъс)").clicked() {
                             duplicate = Some(idx);
                         }
                         if ui.button("✖").on_hover_text("Премахни от проекта").clicked() {
                             remove = Some(idx);
                         }
-                        if r.changed() && matches!(status, Status::Done | Status::Failed | Status::Cancelled) {
+                        if (r.changed() || pasted) && matches!(status, Status::Done | Status::Failed | Status::Cancelled) {
                             *job.state.lock().unwrap() = Default::default();
                         }
                     });
                     if !imported {
                         ui.horizontal(|ui| {
-                            let changed_a = tc_ui(ui, ("start", job.id), "Начало:", &mut job.start);
+                            let changed_a = tc_ui(ui, ("start", job.id), "Начало:", &mut job.start, typed);
                             ui.add_space(16.0);
-                            let changed_b = tc_ui(ui, ("end", job.id), "Край:", &mut job.end);
+                            let changed_b = tc_ui(ui, ("end", job.id), "Край:", &mut job.end, typed);
                             if (changed_a || changed_b) && matches!(status, Status::Done | Status::Failed | Status::Cancelled) {
                                 *job.state.lock().unwrap() = Default::default();
                             }
@@ -939,7 +1003,13 @@ impl App {
                         });
                     }
                     Status::Failed => {
-                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), format!("✖ {info}"));
+                        ui.horizontal(|ui| {
+                            ui.colored_label(egui::Color32::from_rgb(220, 60, 60), format!("✖ {info}"));
+                            let log = job.state.lock().unwrap().log.clone();
+                            if let Some(log) = log_buttons(ui, log) {
+                                show_log = Some((format!("Откъс {}", idx + 1), log));
+                            }
+                        });
                     }
                     Status::Cancelled => {
                         ui.weak(info);
@@ -970,6 +1040,9 @@ impl App {
         }
         if let Some(id) = redownload {
             self.start_jobs(ui.ctx(), Some(id));
+        }
+        if show_log.is_some() {
+            self.log_view = show_log;
         }
 
         ui.add_space(4.0);
@@ -1013,11 +1086,50 @@ fn new_job(id: u64) -> Job {
     }
 }
 
-/// Три падащи менюта ЧЧ:ММ:СС + поле за бързо въвеждане на таймкод.
-fn tc_ui(ui: &mut egui::Ui, id: (&str, u64), label: &str, tc: &mut Tc) -> bool {
+/// Десен бутон върху текстово поле: Постави (заменя съдържанието), Копирай, Изчисти. Връща дали текстът е сменен.
+fn edit_menu(r: &egui::Response, text: &mut String) -> bool {
+    let mut changed = false;
+    r.context_menu(|ui| {
+        if ui.button("📋 Постави").clicked() {
+            if let Some(t) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+                *text = t.trim().to_string();
+                changed = true;
+            }
+            ui.close_menu();
+        }
+        if ui.add_enabled(!text.is_empty(), egui::Button::new("Копирай")).clicked() {
+            ui.ctx().copy_text(text.clone());
+            ui.close_menu();
+        }
+        if ui.add_enabled(!text.is_empty(), egui::Button::new("✖ Изчисти")).clicked() {
+            text.clear();
+            changed = true;
+            ui.close_menu();
+        }
+    });
+    changed
+}
+
+/// Бутоните до грешка; връща лога, ако е натиснат „Детайли“.
+fn log_buttons(ui: &mut egui::Ui, log: String) -> Option<String> {
+    if log.is_empty() {
+        return None;
+    }
+    if ui.small_button("📋 Копирай лога").on_hover_text("Пълният лог (линк, настройки, грешка) отива в клипборда").clicked() {
+        ui.ctx().copy_text(log.clone());
+    }
+    ui.small_button("🔍 Детайли…").clicked().then_some(log)
+}
+
+/// ЧЧ:ММ:СС — падащи менюта или (`typed`) полета за писане + поле за бързо въвеждане на таймкод.
+fn tc_ui(ui: &mut egui::Ui, id: (&str, u64), label: &str, tc: &mut Tc, typed: bool) -> bool {
     let before = *tc;
     ui.label(label);
     let combo = |ui: &mut egui::Ui, salt: &str, v: &mut u32, max: u32, hint: &str| {
+        if typed {
+            typed_field(ui, egui::Id::new((id, salt, "typed")), v, max, hint);
+            return;
+        }
         egui::ComboBox::from_id_salt((id, salt))
             .width(46.0)
             .selected_text(format!("{:02}", *v))
@@ -1047,6 +1159,36 @@ fn tc_ui(ui: &mut egui::Ui, id: (&str, u64), label: &str, tc: &mut Tc) -> bool {
     }
     ui.data_mut(|d| d.insert_temp(text_id, text));
     *tc != before
+}
+
+/// Поле за едно число от таймкода: при фокус всичко се маркира, „9“ = 09, над максимума → максимума.
+fn typed_field(ui: &mut egui::Ui, fid: egui::Id, v: &mut u32, max: u32, hint: &str) {
+    let buf_id = fid.with("buf");
+    let focused = ui.memory(|m| m.has_focus(fid));
+    let mut text: String = if focused { ui.data_mut(|d| d.get_temp(buf_id)).unwrap_or_default() } else { format!("{:02}", *v) };
+    let out = egui::TextEdit::singleline(&mut text)
+        .id(fid)
+        .desired_width(26.0)
+        .char_limit(2)
+        .horizontal_align(egui::Align::Center)
+        .show(ui);
+    if out.response.gained_focus() {
+        let mut state = out.state;
+        let n = text.chars().count();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
+        state.store(ui.ctx(), fid);
+    }
+    text.retain(|c| c.is_ascii_digit());
+    if out.response.changed() {
+        if let Ok(n) = text.parse::<u32>() {
+            *v = n.min(max);
+        }
+    }
+    if out.response.lost_focus() && text.is_empty() {
+        *v = 0;
+    }
+    ui.data_mut(|d| d.insert_temp(buf_id, text));
+    out.response.on_hover_text(hint);
 }
 
 impl eframe::App for App {
@@ -1167,6 +1309,7 @@ impl eframe::App for App {
         });
 
         self.quick_ui(ctx);
+        self.log_ui(ctx);
         let clips = self.clip_refs();
         for e in &mut self.editors {
             e.show(ctx, &clips);
