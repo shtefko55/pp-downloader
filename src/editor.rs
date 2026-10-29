@@ -1051,9 +1051,7 @@ impl Editor {
                         if !m.spans.is_empty() && ui.small_button("Видима през целия клип").clicked() {
                             m.spans.clear();
                         }
-                        if !m.spans.is_empty() {
-                            ui.weak("Ръбовете на участъците се местят с влачене в долната лента на timeline-а.");
-                        }
+                        ui.weak("Ръбовете се местят с влачене в жълтата лента най-долу в timeline-а.");
                     }
                 });
             }
@@ -1201,21 +1199,25 @@ impl Editor {
 
         // Видимост на избраната маска: лента най-долу.
         let lane = Rect::from_min_max(pos2(wave.left(), wave.bottom() - 16.0), wave.max);
-        let sel_mask = self.selected.and_then(|i| Some((i, self.state.masks.get(i)?.spans.clone())));
+        // Маска през целия клип = един участък 0–край; ръбовете му се влачат веднага.
+        let sel_mask = self.selected.and_then(|i| {
+            let spans = &self.state.masks.get(i)?.spans;
+            Some((i, if spans.is_empty() { vec![[0.0, dur]] } else { spans.clone() }))
+        });
         if let Some((i, spans)) = &sel_mask {
             painter.rect_filled(lane, 0.0, Color32::from_black_alpha(190));
             let on = Color32::from_rgba_unmultiplied(255, 215, 0, 150);
-            let full = [[0.0, dur]];
-            for sp in if spans.is_empty() { &full[..] } else { &spans[..] } {
+            for sp in spans {
                 let (a, b) = (tx(sp[0]).max(lane.left()), tx(sp[1]).min(lane.right()));
                 if b > a {
                     painter.rect_filled(Rect::from_min_max(pos2(a, lane.top() + 2.0), pos2(b, lane.bottom() - 2.0)), 2.0, on);
                 }
-                if !spans.is_empty() {
-                    for x in [tx(sp[0]), tx(sp[1])] {
-                        if x >= lane.left() && x <= lane.right() {
-                            painter.line_segment([pos2(x, lane.top()), pos2(x, lane.bottom())], Stroke::new(2.0_f32, Color32::YELLOW));
-                        }
+                // Ръбовете са дръжки: по-широки и навътре от края на лентата, за да се хващат и в 0 и в края.
+                for (x, dir) in [(tx(sp[0]), 1.0_f32), (tx(sp[1]), -1.0)] {
+                    if x >= lane.left() - 1.0 && x <= lane.right() + 1.0 {
+                        let x = x.clamp(lane.left() + 2.0, lane.right() - 2.0);
+                        let grip = Rect::from_two_pos(pos2(x, lane.top() + 1.0), pos2(x + dir * 5.0, lane.bottom() - 1.0));
+                        painter.rect_filled(grip, 1.0, Color32::YELLOW);
                     }
                 }
             }
@@ -1236,7 +1238,11 @@ impl Editor {
                 .iter()
                 .enumerate()
                 .flat_map(|(k, sp)| [(k, false, sp[0]), (k, true, sp[1])])
-                .find_map(|(k, end, t)| ((tx(t) - p.x).abs() < 6.0).then_some((k, end)))
+                .find_map(|(k, end, t)| {
+                    let x = tx(t);
+                    let visible = x >= lane.left() - 1.0 && x <= lane.right() + 1.0;
+                    (visible && (x.clamp(lane.left() + 4.0, lane.right() - 4.0) - p.x).abs() < 7.0).then_some((k, end))
+                })
         };
 
         let xp = tx(self.playhead);
@@ -1271,6 +1277,11 @@ impl Editor {
             self.drag = if let Some(d) = fade_at(p) {
                 d
             } else if let Some((k, end)) = span_edge_at(p) {
+                if let Some(m) = self.selected.and_then(|i| self.state.masks.get_mut(i)) {
+                    if m.spans.is_empty() {
+                        m.spans.push([0.0, dur]);
+                    }
+                }
                 Drag::Span(k, end)
             } else if near(xi, p) {
                 Drag::In
