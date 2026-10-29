@@ -183,11 +183,23 @@ pub struct AudioShared {
     pos: AtomicU64,
     seek: AtomicI64,
     playing: AtomicBool,
+    /// IN, OUT, fade in, fade out (секунди, f64 битове) — за fade-а при пускане.
+    fades: [AtomicU64; 4],
 }
 
 impl AudioShared {
     pub fn set_samples(&self, s: Arc<Vec<f32>>) {
         *self.samples.lock().unwrap() = s;
+    }
+
+    pub fn set_fades(&self, in_t: f64, out_t: f64, fade_in: f64, fade_out: f64) {
+        for (a, v) in self.fades.iter().zip([in_t, out_t, fade_in, fade_out]) {
+            a.store(v.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    fn fades(&self) -> [f64; 4] {
+        self.fades.each_ref().map(|a| f64::from_bits(a.load(Ordering::Relaxed)))
     }
 }
 
@@ -205,6 +217,7 @@ impl AudioOut {
             pos: AtomicU64::new(0),
             seek: AtomicI64::new(-1),
             playing: AtomicBool::new(false),
+            fades: Default::default(),
         });
         let quit = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -255,9 +268,9 @@ fn open_stream(sh: Arc<AudioShared>) -> Option<(cpal::Stream, u32)> {
     let channels = config.channels() as usize;
     let cfg: cpal::StreamConfig = config.config();
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => build::<f32>(&device, &cfg, channels, sh),
-        cpal::SampleFormat::I16 => build::<i16>(&device, &cfg, channels, sh),
-        cpal::SampleFormat::U16 => build::<u16>(&device, &cfg, channels, sh),
+        cpal::SampleFormat::F32 => build::<f32>(&device, &cfg, channels, rate, sh),
+        cpal::SampleFormat::I16 => build::<i16>(&device, &cfg, channels, rate, sh),
+        cpal::SampleFormat::U16 => build::<u16>(&device, &cfg, channels, rate, sh),
         _ => None,
     }?;
     stream.play().ok()?;
@@ -268,6 +281,7 @@ fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
     device: &cpal::Device,
     cfg: &cpal::StreamConfig,
     channels: usize,
+    rate: u32,
     sh: Arc<AudioShared>,
 ) -> Option<cpal::Stream> {
     device
@@ -278,11 +292,13 @@ fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
                 let mut pos = if seek >= 0 { seek as u64 } else { sh.pos.load(Ordering::SeqCst) };
                 let playing = sh.playing.load(Ordering::SeqCst);
                 let samples = sh.samples.try_lock().ok().map(|s| s.clone());
+                let [in_t, out_t, fade_in, fade_out] = sh.fades();
                 for frame in data.chunks_mut(channels) {
                     let (l, r) = if playing {
                         let i = pos as usize * 2;
+                        let g = crate::editor::fade_gain(pos as f64 / rate as f64, in_t, out_t, fade_in, fade_out);
                         pos += 1;
-                        samples.as_ref().and_then(|s| Some((*s.get(i)?, *s.get(i + 1)?))).unwrap_or((0.0, 0.0))
+                        samples.as_ref().and_then(|s| Some((*s.get(i)? * g, *s.get(i + 1)? * g))).unwrap_or((0.0, 0.0))
                     } else {
                         (0.0, 0.0)
                     };

@@ -111,7 +111,7 @@ mod tests {
         let mut job = crate::new_job(1);
         job.url = "https://example.com/v".into();
         job.done = Some((dir.join("клип [00-01-00_00-02-00].mp4"), 5.0, 65.0));
-        job.edit = Some(EditState { in_t: 5.2, out_t: 64.0, masks: Vec::new(), exported: Some(dir.join("Готови").join("Финал.mp4")) });
+        job.edit = Some(EditState { in_t: 5.2, out_t: 64.0, masks: Vec::new(), exported: Some(dir.join("Готови").join("Финал.mp4")), ..Default::default() });
         p.jobs.push(job);
         p.save().unwrap();
 

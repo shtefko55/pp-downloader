@@ -181,39 +181,44 @@ pub fn ensure_workers(
         thread::spawn(move || {
             loop {
                 let Some(task) = queue.lock().unwrap().pop_front() else { break };
-                {
-                    let mut st = task.state.lock().unwrap();
-                    st.status = Status::Working;
-                    st.progress = 0.0;
-                    st.info = "Анализ на линка…".into();
-                }
-                ctx.request_repaint();
-                let result = process(&task, &tools, &cancel, &ctx);
-                let mut st = task.state.lock().unwrap();
-                match result {
-                    Ok(path) => {
-                        st.status = Status::Done;
-                        st.progress = 1.0;
-                        st.info = format!("Готово: {}", path.file_name().unwrap_or_default().to_string_lossy());
-                        st.output = Some(path);
-                        st.marks = task.marks;
-                    }
-                    Err(e) if e == CANCELLED => {
-                        st.status = Status::Cancelled;
-                        st.info = CANCELLED.into();
-                    }
-                    Err(e) => {
-                        st.status = Status::Failed;
-                        st.info = e;
-                    }
-                }
-                drop(st);
-                ctx.request_repaint();
+                run_task(&task, &tools, &cancel, &ctx);
             }
             active.fetch_sub(1, Ordering::SeqCst);
             ctx.request_repaint();
         });
     }
+}
+
+/// Сваля един откъс и записва резултата в състоянието му.
+pub fn run_task(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::egui::Context) {
+    {
+        let mut st = task.state.lock().unwrap();
+        st.status = Status::Working;
+        st.progress = 0.0;
+        st.info = "Анализ на линка…".into();
+    }
+    ctx.request_repaint();
+    let result = process(task, tools, cancel, ctx);
+    let mut st = task.state.lock().unwrap();
+    match result {
+        Ok(path) => {
+            st.status = Status::Done;
+            st.progress = 1.0;
+            st.info = format!("Готово: {}", path.file_name().unwrap_or_default().to_string_lossy());
+            st.output = Some(path);
+            st.marks = task.marks;
+        }
+        Err(e) if e == CANCELLED => {
+            st.status = Status::Cancelled;
+            st.info = CANCELLED.into();
+        }
+        Err(e) => {
+            st.status = Status::Failed;
+            st.info = e;
+        }
+    }
+    drop(st);
+    ctx.request_repaint();
 }
 
 struct Stream {
@@ -278,12 +283,21 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
     let res = if task.opts.max_res > 0 { format!("res:{}", task.opts.max_res) } else { "res".into() };
     let sort = format!("{res},fps,vcodec:h264,acodec:aac");
     // Сайтове без собствен модул в yt-dlp (напр. bnt.bg): видеото се търси в HTML-а на страницата.
-    let (info, page_title) = match resolve(yt, &task.url, &sort, cancel) {
-        Ok(info) => (info, None),
+    // Защитната стена на bnt.bg (FortiWeb) пропуска само заявки, които изглеждат като от браузър:
+    // пълен User-Agent, Referer и бисквитката от страницата — същото, което праща разширението в браузъра.
+    let (info, page_title, cookie) = match resolve(yt, &task.url, &sort, None, cancel) {
+        Ok(info) => (info, None, String::new()),
         Err(e) if e.contains("Unsupported URL") => {
-            let html = fetch_page(&task.url, cancel)?.replace("\\/", "/");
-            let media = find_media_url(&html, &task.url).ok_or(format!("Не е намерено видео на страницата ({e})"))?;
-            (resolve(yt, &media, &sort, cancel)?, find_og_title(&html))
+            let (html, cookie) = fetch_page(&task.url, cancel)?;
+            let html = html.replace("\\/", "/");
+            let media = find_media_url(&html, &task.url).ok_or_else(|| {
+                if is_block_page(&html) {
+                    "Сайтът блокира заявката (защитна стена). Изчакай няколко минути и опитай пак.".to_string()
+                } else {
+                    format!("Не е намерено видео на страницата ({e})")
+                }
+            })?;
+            (resolve(yt, &media, &sort, Some(&task.url), cancel)?, find_og_title(&html), cookie)
         }
         Err(e) => return Err(e),
     };
@@ -292,6 +306,11 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
         Some(arr) => arr.iter().filter_map(Stream::from_json).collect(),
         None => Stream::from_json(&info).into_iter().collect(),
     };
+    if !cookie.is_empty() {
+        for s in &mut streams {
+            s.headers += &format!("Cookie: {cookie}\r\n");
+        }
+    }
     // Директен файл: yt-dlp не знае кодеците, питаме ffprobe.
     let mut height = info["height"].as_u64();
     if let [s] = streams.as_mut_slice() {
@@ -390,19 +409,57 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
     Ok(out)
 }
 
-fn resolve(yt: &Path, url: &str, sort: &str, cancel: &AtomicBool) -> Result<Value, String> {
+const BROWSER_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
+/// `referer` — страницата, от която е взет линкът към видеото (заявката изглежда като от браузъра).
+fn resolve(yt: &Path, url: &str, sort: &str, referer: Option<&str>, cancel: &AtomicBool) -> Result<Value, String> {
     let mut cmd = command(yt);
-    cmd.args(["-J", "--no-playlist", "--no-warnings", "--encoding", "utf-8", "-f", "bv*+ba/b", "-S", sort, url]);
+    cmd.args(["-J", "--no-playlist", "--no-warnings", "--encoding", "utf-8", "-f", "bv*+ba/b", "-S", sort]);
+    if let Some(r) = referer {
+        cmd.args(["--referer", r, "--user-agent", BROWSER_UA]);
+    }
+    cmd.arg(url);
     let json = run_capture(cmd, cancel)?;
     serde_json::from_str(&json).map_err(|e| format!("Неразбираем отговор от yt-dlp: {e}"))
 }
 
-fn fetch_page(url: &str, cancel: &AtomicBool) -> Result<String, String> {
+/// HTML-ът на страницата и бисквитките, които сайтът е дал („име=стойност; …“).
+fn fetch_page(url: &str, cancel: &AtomicBool) -> Result<(String, String), String> {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let jar = std::env::temp_dir().join(format!("pp_cookies_{}_{nanos}.txt", std::process::id()));
     let mut cmd = Command::new("curl.exe");
     cmd.creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
-        .args(["-sSL", "--compressed", "--max-time", "30", "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", url]);
-    run_capture(cmd, cancel).map_err(|e| format!("Страницата не може да се зареди: {e}"))
+        .args(["-sSL", "--compressed", "--max-time", "30", "-A", BROWSER_UA])
+        .args(["-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"])
+        .args(["-H", "Accept-Language: bg,en;q=0.8"])
+        .arg("-c")
+        .arg(&jar)
+        .arg(url);
+    let html = run_capture(cmd, cancel).map_err(|e| format!("Страницата не може да се зареди: {e}"));
+    let cookie = std::fs::read_to_string(&jar).map(|j| cookie_header(&j)).unwrap_or_default();
+    let _ = std::fs::remove_file(&jar);
+    Ok((html?, cookie))
+}
+
+/// Netscape cookie файл на curl → стойност за заглавката Cookie.
+fn cookie_header(jar: &str) -> String {
+    jar.lines()
+        .map(|l| l.strip_prefix("#HttpOnly_").unwrap_or(l))
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f.len() >= 7).then(|| format!("{}={}", f[5], f[6].trim_end()))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Страница на защитната стена вместо истинската.
+fn is_block_page(html: &str) -> bool {
+    let h = html.to_lowercase();
+    ["web page blocked", "request rejected", "access denied", "attack id", "fortiweb"].iter().any(|s| h.contains(s))
 }
 
 /// Първият линк към .m3u8 или .mp4 в страницата, като абсолютен URL.
@@ -530,6 +587,13 @@ fn unique_path(dir: &Path, base: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookies_from_curl_jar() {
+        let jar = "# Netscape HTTP Cookie File\n# https://curl.se/docs/http-cookies.html\n\n#HttpOnly_bnt.bg\tFALSE\t/\tFALSE\t1824700000\tcookiesession1\t678B76\nbnt.bg\tFALSE\t/\tFALSE\t0\tlang\tbg\r\n";
+        assert_eq!(cookie_header(jar), "cookiesession1=678B76; lang=bg");
+        assert_eq!(cookie_header(""), "");
+    }
 
     /// Реално сваляне от YouTube: `cargo test -- --ignored --nocapture`
     #[test]

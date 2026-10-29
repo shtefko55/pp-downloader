@@ -106,8 +106,38 @@ struct Saved {
     edits: HashMap<String, EditState>,
 }
 
+/// Отделен прозорец за бързо сваляне на един откъс, без да се пипа списъкът на проекта.
+#[derive(Default)]
+struct Quick {
+    open: bool,
+    url: String,
+    name: String,
+    start: Tc,
+    end: Tc,
+    state: Shared,
+    cancel: Arc<AtomicBool>,
+    /// Редакцията от редактора — пренася се, ако откъсът се добави в проекта.
+    edit: Option<EditState>,
+}
+
+impl Quick {
+    fn status(&self) -> Status {
+        self.state.lock().unwrap().status
+    }
+
+    fn working(&self) -> bool {
+        matches!(self.status(), Status::Queued | Status::Working)
+    }
+
+    fn output(&self) -> Option<PathBuf> {
+        let st = self.state.lock().unwrap();
+        (st.status == Status::Done).then(|| st.output.clone()).flatten()
+    }
+}
+
 struct App {
     saved: Saved,
+    quick: Quick,
     project: Project,
     /// Последно записаното съдържание на проекта — записва се само при промяна.
     last_json: String,
@@ -187,6 +217,7 @@ impl App {
 
         let mut app = App {
             saved,
+            quick: Quick::default(),
             project,
             last_json: String::new(),
             last_autosave: Instant::now(),
@@ -279,7 +310,7 @@ impl App {
                 ui.weak("Проверка за нова версия…");
             }
             U::Available { version, url, notes } => {
-                let busy = self.busy() || self.editors.iter().any(|e| e.exporting());
+                let busy = self.busy() || self.quick.working() || self.editors.iter().any(|e| e.exporting());
                 let button = colored_button(&format!("⬇ Обнови до v{version}"), GREEN).min_size(egui::vec2(0.0, 32.0));
                 let hover = if busy {
                     "Изчакай свалянето/експорта да приключи.".to_string()
@@ -350,15 +381,24 @@ impl App {
         self.project.jobs.push(job);
     }
 
+    /// Задача за сваляне: таймкодовете се разширяват с handles.
+    fn make_task(&self, url: &str, name: &str, start: Tc, end: Tc, state: Shared) -> Task {
+        let s = &self.saved.settings;
+        let cut = start.secs().saturating_sub(s.handles);
+        Task {
+            url: url.trim().to_string(),
+            name: name.to_string(),
+            cut_start: cut,
+            cut_end: end.secs() + s.handles,
+            label: format!("{}_{}", start.file_label(), end.file_label()),
+            marks: (start.secs() as f64 - cut as f64, end.secs() as f64 - cut as f64),
+            opts: worker::Options { out_dir: self.project.dir(), precise: s.precise, max_res: s.max_res, crf: s.crf },
+            state,
+        }
+    }
+
     /// Пуска всички чакащи откъси, или само един (`only`).
     fn start_jobs(&mut self, ctx: &egui::Context, only: Option<u64>) {
-        let s = &self.saved.settings;
-        let opts = worker::Options {
-            out_dir: self.project.dir(),
-            precise: s.precise,
-            max_res: s.max_res,
-            crf: s.crf,
-        };
         let mut queue = self.queue.lock().unwrap();
         for job in self.project.jobs.iter().filter(|j| only.map_or(true, |id| j.id == id)) {
             let mut st = job.state.lock().unwrap();
@@ -374,22 +414,172 @@ impl App {
             st.progress = 0.0;
             st.info = "В опашката".into();
             st.output = None;
-            queue.push_back(Task {
-                url: job.url.trim().to_string(),
-                name: job.name.clone(),
-                cut_start: job.start.secs().saturating_sub(s.handles),
-                cut_end: job.end.secs() + s.handles,
-                label: format!("{}_{}", job.start.file_label(), job.end.file_label()),
-                marks: {
-                    let cut = job.start.secs().saturating_sub(s.handles) as f64;
-                    (job.start.secs() as f64 - cut, job.end.secs() as f64 - cut)
-                },
-                opts: opts.clone(),
-                state: job.state.clone(),
-            });
+            queue.push_back(self.make_task(&job.url, &job.name, job.start, job.end, job.state.clone()));
         }
         drop(queue);
-        worker::ensure_workers(&self.queue, &self.active, &self.cancel, s.parallel, &self.tools, ctx);
+        worker::ensure_workers(&self.queue, &self.active, &self.cancel, self.saved.settings.parallel, &self.tools, ctx);
+    }
+
+    fn start_quick(&mut self, ctx: &egui::Context) {
+        if self.quick.url.trim().is_empty() || self.quick.working() {
+            return;
+        }
+        // Нов откъс: предишният остава на диска, но редакцията му вече не се помни тук.
+        self.quick.edit = None;
+        let q = &self.quick;
+        if q.end.secs() <= q.start.secs() {
+            let mut st = q.state.lock().unwrap();
+            st.status = Status::Failed;
+            st.info = "Краят трябва да е след началото".into();
+            return;
+        }
+        let task = self.make_task(&q.url, &q.name, q.start, q.end, q.state.clone());
+        q.state.lock().unwrap().status = Status::Queued;
+        q.cancel.store(false, Ordering::SeqCst);
+        let (tools, cancel, ctx) = (self.tools.clone(), q.cancel.clone(), ctx.clone());
+        std::thread::spawn(move || worker::run_task(&task, &tools, &cancel, &ctx));
+    }
+
+    /// Сваленият в прозореца откъс влиза в проекта като обикновен ред.
+    fn quick_to_project(&mut self) {
+        let Some(path) = self.quick.output() else { return };
+        self.store_edits();
+        if self.project.jobs.iter().any(|j| j.done.as_ref().is_some_and(|d| d.0 == path)) {
+            return;
+        }
+        if self.project.jobs.len() == 1 && self.project.jobs[0].url.trim().is_empty() && self.project.jobs[0].done.is_none() {
+            self.project.jobs.clear();
+        }
+        let q = &mut self.quick;
+        self.project.next_id += 1;
+        let mut job = new_job(self.project.next_id);
+        job.url = q.url.trim().to_string();
+        job.name = q.name.clone();
+        job.start = q.start;
+        job.end = q.end;
+        job.edit = q.edit.take();
+        {
+            let src = q.state.lock().unwrap();
+            let mut st = job.state.lock().unwrap();
+            st.status = Status::Done;
+            st.progress = 1.0;
+            st.info = src.info.clone();
+            st.output = Some(path.clone());
+            st.marks = src.marks;
+            job.done = Some((path, src.marks.0, src.marks.1));
+        }
+        self.project.jobs.push(job);
+        *q = Quick { open: q.open, ..Default::default() };
+        self.scroll_to_add = true;
+    }
+
+    fn quick_ui(&mut self, ctx: &egui::Context) {
+        if !self.quick.open {
+            return;
+        }
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Единично сваляне")
+            .with_inner_size([820.0, 300.0])
+            .with_min_inner_size([640.0, 240.0]);
+        let mut edit = None;
+        let mut start = false;
+        let mut to_project = false;
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("quick"), builder, |ctx, _| {
+            if ctx.input(|i| i.viewport().close_requested()) {
+                self.quick.open = false;
+                self.quick.cancel.store(true, Ordering::SeqCst);
+            }
+            let handles = self.saved.settings.handles;
+            let q = &mut self.quick;
+            let working = q.working();
+            let (status, progress, info, marks) = {
+                let st = q.state.lock().unwrap();
+                (st.status, st.progress, st.info.clone(), st.marks)
+            };
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label("Сваля един откъс в папката на проекта, без да пипа списъка и без да чака опашката.");
+                ui.add_space(4.0);
+                let fresh = ui
+                    .add_enabled_ui(!working, |ui| {
+                        let mut changed = false;
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - 210.0).max(200.0);
+                            changed |= ui.add(egui::TextEdit::singleline(&mut q.url).hint_text("Линк (YouTube, bnt.bg …)").desired_width(w)).changed();
+                            ui.add(egui::TextEdit::singleline(&mut q.name).hint_text("Име на файла (по избор)").desired_width(200.0));
+                        });
+                        ui.horizontal(|ui| {
+                            changed |= tc_ui(ui, ("qstart", 0), "Начало:", &mut q.start);
+                            ui.add_space(16.0);
+                            changed |= tc_ui(ui, ("qend", 0), "Край:", &mut q.end);
+                            ui.add_space(16.0);
+                            let (a, b) = (q.start.secs(), q.end.secs());
+                            if b > a {
+                                let (ca, cb) = (a.saturating_sub(handles), b + handles);
+                                ui.weak(format!("Реже се: {} – {}  ({})", fmt_secs(ca), fmt_secs(cb), fmt_secs(cb - ca)));
+                            }
+                        });
+                        changed
+                    })
+                    .inner;
+                if fresh && matches!(status, Status::Done | Status::Failed | Status::Cancelled) {
+                    *q.state.lock().unwrap() = Default::default();
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if working {
+                        if ui.add(colored_button("⏹ Спри", RED).min_size(egui::vec2(80.0, 30.0))).clicked() {
+                            q.cancel.store(true, Ordering::SeqCst);
+                        }
+                    } else {
+                        let ready = !q.url.trim().is_empty() && status != Status::Done;
+                        start = ui.add_enabled(ready, colored_button("⬇  Свали", GREEN).min_size(egui::vec2(140.0, 30.0))).clicked();
+                    }
+                });
+                ui.add_space(4.0);
+                match status {
+                    Status::Queued | Status::Working => {
+                        ui.add(egui::ProgressBar::new(progress).text(info).animate(true));
+                    }
+                    Status::Done => {
+                        ui.colored_label(egui::Color32::from_rgb(40, 170, 80), format!("✔ {info}"));
+                        ui.horizontal(|ui| {
+                            if let Some(p) = q.output() {
+                                let label = if q.edit.is_some() { "✂ Редактирай (има промени)" } else { "✂ Редактирай" };
+                                if ui.add(colored_button(label, PURPLE).min_size(egui::vec2(0.0, 28.0))).clicked() {
+                                    edit = Some((p.clone(), marks, q.edit.clone()));
+                                }
+                                if ui.button("Покажи файла").clicked() {
+                                    show_in_explorer(&p);
+                                }
+                                to_project = ui
+                                    .add(colored_button("➕ Добави в проекта", BLUE).min_size(egui::vec2(0.0, 28.0)))
+                                    .on_hover_text("Откъсът (и редакцията му) влиза в списъка на проекта, а прозорецът се изчиства за следващ.")
+                                    .clicked();
+                                if ui.button("Нов откъс").on_hover_text("Изчисти прозореца (файлът остава на диска)").clicked() {
+                                    *q = Quick { open: true, ..Default::default() };
+                                }
+                            }
+                        });
+                    }
+                    Status::Failed => {
+                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), format!("✖ {info}"));
+                    }
+                    Status::Idle | Status::Cancelled => {
+                        ui.weak(info);
+                    }
+                }
+            });
+        });
+        if start {
+            self.start_quick(ctx);
+        }
+        if let Some((path, marks, state)) = edit {
+            self.open_editor(path, Some(marks), state, ctx);
+        }
+        if to_project {
+            self.quick_to_project();
+        }
     }
 
     fn stop_all(&mut self) {
@@ -448,9 +638,12 @@ impl App {
 
     /// Копира IN/OUT, маските и експорта от отворените редактори в откъсите на проекта.
     fn store_edits(&mut self) {
+        let quick_out = self.quick.output();
         for e in &self.editors {
             if let Some(job) = self.project.jobs.iter_mut().find(|j| j.done.as_ref().is_some_and(|d| d.0 == e.path)) {
                 job.edit = Some(e.state.clone());
+            } else if quick_out.as_ref() == Some(&e.path) {
+                self.quick.edit = Some(e.state.clone());
             }
         }
     }
@@ -833,6 +1026,14 @@ impl eframe::App for App {
                             ctx.request_repaint();
                         });
                     }
+                    if ui
+                        .add(colored_button("⚡ Единично сваляне", GREEN).min_size(big))
+                        .on_hover_text("Отделен прозорец: свали и редактирай един откъс, без да пипаш списъка")
+                        .clicked()
+                    {
+                        self.quick.open = true;
+                        ctx.send_viewport_cmd_to(egui::ViewportId::from_hash_of("quick"), egui::ViewportCommand::Focus);
+                    }
                     if ui.add(colored_button("📂 Отвори видео…", PURPLE).min_size(big)).on_hover_text("Добави видео от диска в проекта и го редактирай").clicked() {
                         if let Some(p) = rfd::FileDialog::new()
                             .set_directory(self.project.dir())
@@ -899,6 +1100,7 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.jobs_ui(ui));
         });
 
+        self.quick_ui(ctx);
         for e in &mut self.editors {
             e.show(ctx);
         }

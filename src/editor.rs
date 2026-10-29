@@ -44,11 +44,56 @@ pub struct Mask {
     pub blur: f32,
     /// Омекотяване на ръба (пиксели в оригиналния размер).
     pub feather: f32,
+    /// Кога се вижда маската: подредени участъци [от, до) в секунди от клипа. Празно = през целия клип.
+    #[serde(default)]
+    pub spans: Vec<[f64; 2]>,
 }
 
 impl Mask {
     fn new(kind: Kind, points: Vec<[f32; 2]>) -> Self {
-        Mask { kind, points, offset: [0.0, 0.0], scale: 1.0, blur: 25.0, feather: 8.0 }
+        Mask { kind, points, offset: [0.0, 0.0], scale: 1.0, blur: 25.0, feather: 8.0, spans: Vec::new() }
+    }
+
+    pub fn active_at(&self, t: f64) -> bool {
+        self.spans.is_empty() || self.spans.iter().any(|s| t >= s[0] - 1e-6 && t < s[1] - 1e-6)
+    }
+
+    fn span_at(&self, t: f64) -> Option<usize> {
+        self.spans.iter().position(|s| t >= s[0] - 1e-6 && t < s[1] - 1e-6)
+    }
+
+    /// „Появи се тук“: видима от `t` до следващото скриване (или до края).
+    /// Ако досега е била през целия клип — вече се появява чак от `t`.
+    fn show_from(&mut self, t: f64, duration: f64) {
+        if self.spans.is_empty() {
+            self.spans.push([t, duration]);
+            return;
+        }
+        if self.span_at(t).is_some() {
+            return;
+        }
+        self.spans.retain(|s| s[1] - s[0] > 1e-3);
+        match self.spans.iter_mut().find(|s| s[0] > t) {
+            Some(next) => next[0] = t,
+            None => self.spans.push([t, duration]),
+        }
+    }
+
+    /// „Скрий тук“: участъкът, в който е `t`, свършва в `t`.
+    fn hide_from(&mut self, t: f64, duration: f64) {
+        if self.spans.is_empty() {
+            self.spans.push([0.0, duration]);
+        }
+        if let Some(i) = self.span_at(t) {
+            self.spans[i][1] = t;
+            if self.spans[i][1] - self.spans[i][0] < 1e-3 {
+                self.spans.remove(i);
+                // Без нито един участък маската би станала видима навсякъде — оставя се невидим отрязък.
+                if self.spans.is_empty() {
+                    self.spans.push([t, t]);
+                }
+            }
+        }
     }
 
     /// Правоъгълник или елипса, вписани в кутията между два ъгъла.
@@ -103,6 +148,29 @@ pub struct EditState {
     /// Последният експорт — за корекции се предлага същото име.
     #[serde(default)]
     pub exported: Option<PathBuf>,
+    /// Плавно усилване/затихване на звука в началото и края (секунди).
+    #[serde(default)]
+    pub fade_in: f64,
+    #[serde(default)]
+    pub fade_out: f64,
+}
+
+impl EditState {
+    /// Усилване на звука в момент `t` от клипа (извън IN–OUT: 1).
+    pub fn gain_at(&self, t: f64) -> f32 {
+        fade_gain(t, self.in_t, self.out_t, self.fade_in, self.fade_out)
+    }
+}
+
+/// Крива „qsin“ (като afade във ffmpeg) — приблизително постоянна мощност.
+pub fn fade_gain(t: f64, in_t: f64, out_t: f64, fade_in: f64, fade_out: f64) -> f32 {
+    if t < in_t || t >= out_t {
+        return 1.0;
+    }
+    let ramp = |x: f64| (x.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2).sin();
+    let a = if fade_in > 0.0 { ramp((t - in_t) / fade_in) } else { 1.0 };
+    let b = if fade_out > 0.0 { ramp((out_t - t) / fade_out) } else { 1.0 };
+    (a * b) as f32
 }
 
 /// Какво чертае влаченето в картината.
@@ -126,6 +194,10 @@ enum Drag {
     Playhead,
     In,
     Out,
+    FadeIn,
+    FadeOut,
+    /// Ръб на участък от видимостта на избраната маска: (участък, края ли е).
+    Span(usize, bool),
 }
 
 pub struct Editor {
@@ -154,6 +226,8 @@ pub struct Editor {
     audio_data: Arc<Mutex<Option<Result<AudioData, String>>>>,
 
     frame: Option<Vec<u8>>,
+    /// Моментът на показания кадър — за видимостта на маските.
+    frame_t: f64,
     frame_gen: u64,
     texture: Option<egui::TextureHandle>,
     shown_key: String,
@@ -195,7 +269,7 @@ impl Editor {
         let fl = 1.0 / info.fps;
         let mut state = saved.unwrap_or_else(|| {
             let (a, b) = marks.unwrap_or((0.0, info.duration));
-            EditState { in_t: a, out_t: b, masks: Vec::new(), exported: None }
+            EditState { in_t: a, out_t: b, ..Default::default() }
         });
         state.in_t = snap(state.in_t, info.fps).clamp(0.0, (info.duration - fl).max(0.0));
         state.out_t = snap(state.out_t, info.fps).min(info.duration).max(state.in_t + fl);
@@ -243,6 +317,7 @@ impl Editor {
             audio,
             audio_data,
             frame: None,
+            frame_t: 0.0,
             frame_gen: 0,
             texture: None,
             shown_key: String::new(),
@@ -303,11 +378,7 @@ impl Editor {
 
     /// ЧЧ:ММ:СС:КК
     fn tc(&self, t: f64) -> String {
-        let t = t.max(0.0) + 1e-6;
-        let secs = t.floor() as u64;
-        let fr = self.info.fps.round().max(1.0) as u64;
-        let ff = (((t - secs as f64) * self.info.fps).floor() as u64).min(fr - 1);
-        format!("{:02}:{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60, ff)
+        fmt_tc(t, self.info.fps)
     }
 
     fn now(&self) -> f64 {
@@ -365,15 +436,20 @@ impl Editor {
         }
     }
 
-    fn set_frame(&mut self, rgba: Vec<u8>) {
-        self.frame = Some(rgba);
+    fn set_frame(&mut self, f: Frame) {
+        self.frame = Some(f.rgba);
+        self.frame_t = f.t;
         self.frame_gen += 1;
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        if let Some(a) = &self.audio {
+            let s = &self.state;
+            a.shared.set_fades(s.in_t, s.out_t, s.fade_in, s.fade_out);
+        }
         while let Ok(f) = self.fetcher.rx.try_recv() {
             if !self.playing {
-                self.set_frame(f.rgba);
+                self.set_frame(f);
             }
         }
         if !self.playing {
@@ -389,7 +465,7 @@ impl Editor {
                     Some(a) => a.play_from(self.playhead),
                     None => self.clock = Some((Instant::now(), self.playhead)),
                 }
-                latest = Some(f.rgba);
+                latest = Some(f);
             }
         } else {
             let now = self.now();
@@ -400,7 +476,7 @@ impl Editor {
                         self.pending = stream.rx.try_recv().ok();
                     }
                     match &self.pending {
-                        Some(f) if f.t <= now + half => latest = self.pending.take().map(|f| f.rgba),
+                        Some(f) if f.t <= now + half => latest = self.pending.take(),
                         _ => break,
                     }
                 }
@@ -411,8 +487,8 @@ impl Editor {
                 self.playhead = snap(self.play_end - self.frame_len(), self.info.fps).max(0.0);
             }
         }
-        if let Some(rgba) = latest {
-            self.set_frame(rgba);
+        if let Some(f) = latest {
+            self.set_frame(f);
         }
     }
 
@@ -491,6 +567,9 @@ impl Editor {
             let sp = self.pw as f32 / self.info.width as f32;
             self.mask_cache.resize_with(self.state.masks.len(), || None);
             for (m, cache) in self.state.masks.iter().zip(self.mask_cache.iter_mut()) {
+                if !m.active_at(self.frame_t) {
+                    continue;
+                }
                 if cache.as_ref().map_or(true, |(cm, _)| cm != m) {
                     *cache = Some((m.clone(), m.alpha(self.pw, self.ph, sp)));
                 }
@@ -639,7 +718,14 @@ impl Editor {
             let eff = m.effective();
             let pts: Vec<Pos2> = eff.iter().map(to_screen).collect();
             let stroke = if sel { Stroke::new(2.0_f32, Color32::YELLOW) } else { Stroke::new(1.0_f32, Color32::from_white_alpha(170)) };
-            painter.add(Shape::closed_line(pts, stroke));
+            if m.active_at(self.frame_t) {
+                painter.add(Shape::closed_line(pts, stroke));
+            } else {
+                // Скрита в този кадър: пунктир, за да може пак да се избере.
+                let mut closed = pts;
+                closed.extend(closed.first().copied());
+                painter.extend(Shape::dashed_line(&closed, stroke, 6.0, 5.0));
+            }
             if sel {
                 let b = bbox(&eff);
                 let frame = Rect::from_min_max(to_screen(&[b[0], b[1]]), to_screen(&[b[2], b[3]]));
@@ -835,6 +921,31 @@ impl Editor {
     }
 
     fn masks_ui(&mut self, ui: &mut egui::Ui) {
+        if self.info.has_audio {
+            ui.add_space(8.0);
+            ui.heading("Звук");
+            let max = self.state.out_t - self.state.in_t;
+            let s = &mut self.state;
+            egui::Grid::new(("fades", self.viewport)).num_columns(3).show(ui, |ui| {
+                for fade_in in [true, false] {
+                    let other = if fade_in { s.fade_out } else { s.fade_in };
+                    let (label, v) = if fade_in { ("Fade in:", &mut s.fade_in) } else { ("Fade out:", &mut s.fade_out) };
+                    let limit = (max - other).max(0.0);
+                    ui.label(label);
+                    ui.add(egui::DragValue::new(v).range(0.0..=limit).speed(0.02).fixed_decimals(2).suffix(" сек"));
+                    ui.horizontal(|ui| {
+                        for preset in [0.0_f64, 0.5, 1.0] {
+                            if ui.small_button(if preset == 0.0 { "няма".to_string() } else { format!("{preset}") }).clicked() {
+                                *v = preset.min(limit);
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+            ui.weak("Звукът плавно се усилва след IN и затихва преди OUT. Може и с влачене на кръгчетата в timeline-а.");
+            ui.separator();
+        }
         ui.add_space(8.0);
         ui.heading("Blur маски");
         ui.add_space(4.0);
@@ -861,6 +972,8 @@ impl Editor {
 
         let mut remove = None;
         let mut duplicate = None;
+        let mut seek_to = None;
+        let (t, dur, fps) = (self.playhead, self.info.duration, self.info.fps);
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             if self.state.masks.is_empty() {
                 ui.weak("Няма маски.");
@@ -891,6 +1004,56 @@ impl Editor {
                             m.offset = [0.0, 0.0];
                             m.scale = 1.0;
                         }
+                        ui.separator();
+                        ui.label(egui::RichText::new("Кога се вижда").strong());
+                        let active = m.active_at(t);
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                            if ui
+                                .add_enabled(!active || m.spans.is_empty(), crate::colored_button("Покажи от тук", crate::GREEN).min_size(vec2(w, 26.0)))
+                                .on_hover_text("Маската се появява от текущия кадър до следващото скриване")
+                                .clicked()
+                            {
+                                m.show_from(t, dur);
+                            }
+                            if ui
+                                .add_enabled(active, crate::colored_button("Скрий от тук", crate::RED).min_size(vec2(w, 26.0)))
+                                .on_hover_text("Маската изчезва от текущия кадър")
+                                .clicked()
+                            {
+                                m.hide_from(t, dur);
+                            }
+                        });
+                        let visible: Vec<(usize, [f64; 2])> =
+                            m.spans.iter().copied().enumerate().filter(|(_, s)| s[1] - s[0] > 1e-3).collect();
+                        if m.spans.is_empty() {
+                            ui.weak("Видима през целия клип.");
+                        } else if visible.is_empty() {
+                            ui.weak("Скрита през целия клип.");
+                        }
+                        let mut drop_span = None;
+                        for (k, s) in visible {
+                            ui.horizontal(|ui| {
+                                if ui.link(format!("{} – {}", fmt_tc(s[0], fps), fmt_tc(s[1], fps))).on_hover_text("Иди в началото").clicked() {
+                                    seek_to = Some(s[0]);
+                                }
+                                if ui.small_button("✖").on_hover_text("Махни този участък").clicked() {
+                                    drop_span = Some(k);
+                                }
+                            });
+                        }
+                        if let Some(k) = drop_span {
+                            m.spans.remove(k);
+                            if m.spans.iter().all(|s| s[1] - s[0] <= 1e-3) && !m.spans.is_empty() {
+                                m.spans = vec![[0.0, 0.0]];
+                            }
+                        }
+                        if !m.spans.is_empty() && ui.small_button("Видима през целия клип").clicked() {
+                            m.spans.clear();
+                        }
+                        if !m.spans.is_empty() {
+                            ui.weak("Ръбовете на участъците се местят с влачене в долната лента на timeline-а.");
+                        }
                     }
                 });
             }
@@ -905,6 +1068,12 @@ impl Editor {
         if let Some(i) = remove {
             self.state.masks.remove(i);
             self.selected = None;
+        }
+        if let Some(t) = seek_to {
+            if self.playing {
+                self.pause();
+            }
+            self.seek(t);
         }
     }
 
@@ -970,7 +1139,7 @@ impl Editor {
                     let i0 = (t0 / a.peak_secs).max(0.0) as usize;
                     let i1 = ((t1 / a.peak_secs).ceil() as usize).max(i0 + 1).min(a.peaks.len());
                     let p = a.peaks.get(i0..i1).map_or(0.0, |s| s.iter().copied().fold(0.0, f32::max));
-                    let hgt = (p / a.peak_max) * wave.height() * 0.46;
+                    let hgt = (p / a.peak_max) * wave.height() * 0.46 * self.state.gain_at(t0);
                     if hgt > 0.3 {
                         painter.line_segment([pos2(x, mid - hgt), pos2(x, mid + hgt)], Stroke::new(1.0_f32, color));
                     }
@@ -1001,6 +1170,75 @@ impl Editor {
                 painter.text(pos2(x + dir * 4.0, wave.top() + 1.0), align, label, egui::FontId::proportional(12.0), Color32::BLACK);
             }
         }
+        // Fade на звука: крива от ръба до кръгчето, което се влачи.
+        let fade_y = wave.top() + 26.0;
+        let (xfi, xfo) = (tx(self.state.in_t + self.state.fade_in), tx(self.state.out_t - self.state.fade_out));
+        // При нулев fade кръгчето стои малко навътре от маркера, за да не се бърка с него.
+        let fade_handles = [
+            (Drag::FadeIn, xfi + if self.state.fade_in > 0.0 { 0.0 } else { 7.0 }),
+            (Drag::FadeOut, xfo - if self.state.fade_out > 0.0 { 0.0 } else { 7.0 }),
+        ];
+        if self.info.has_audio {
+            let fade_color = Color32::from_rgb(255, 170, 60);
+            for ((x_edge, x_end, len), (_, x_handle)) in
+                [(xi, xfi, self.state.fade_in), (xo, xfo, self.state.fade_out)].into_iter().zip(fade_handles)
+            {
+                if len > 0.0 {
+                    let curve: Vec<Pos2> = (0..=24)
+                        .map(|k| {
+                            let u = k as f32 / 24.0;
+                            let g = (u * std::f32::consts::FRAC_PI_2).sin();
+                            pos2(x_edge + (x_end - x_edge) * u, wave.bottom() - (wave.bottom() - fade_y) * g)
+                        })
+                        .collect();
+                    painter.add(Shape::line(curve, Stroke::new(1.5_f32, fade_color)));
+                }
+                if x_handle >= r.left() - 6.0 && x_handle <= r.right() + 6.0 {
+                    painter.circle(pos2(x_handle, fade_y), 5.0, fade_color, Stroke::new(1.0_f32, Color32::BLACK));
+                }
+            }
+        }
+
+        // Видимост на избраната маска: лента най-долу.
+        let lane = Rect::from_min_max(pos2(wave.left(), wave.bottom() - 16.0), wave.max);
+        let sel_mask = self.selected.and_then(|i| Some((i, self.state.masks.get(i)?.spans.clone())));
+        if let Some((i, spans)) = &sel_mask {
+            painter.rect_filled(lane, 0.0, Color32::from_black_alpha(190));
+            let on = Color32::from_rgba_unmultiplied(255, 215, 0, 150);
+            let full = [[0.0, dur]];
+            for sp in if spans.is_empty() { &full[..] } else { &spans[..] } {
+                let (a, b) = (tx(sp[0]).max(lane.left()), tx(sp[1]).min(lane.right()));
+                if b > a {
+                    painter.rect_filled(Rect::from_min_max(pos2(a, lane.top() + 2.0), pos2(b, lane.bottom() - 2.0)), 2.0, on);
+                }
+                if !spans.is_empty() {
+                    for x in [tx(sp[0]), tx(sp[1])] {
+                        if x >= lane.left() && x <= lane.right() {
+                            painter.line_segment([pos2(x, lane.top()), pos2(x, lane.bottom())], Stroke::new(2.0_f32, Color32::YELLOW));
+                        }
+                    }
+                }
+            }
+            painter.text(
+                lane.left_center() + vec2(4.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("Маска {} — кога се вижда", i + 1),
+                egui::FontId::proportional(11.0),
+                Color32::WHITE,
+            );
+        }
+        let span_edge_at = |p: Pos2| -> Option<(usize, bool)> {
+            let (_, spans) = sel_mask.as_ref()?;
+            if !lane.expand(2.0).contains(p) {
+                return None;
+            }
+            spans
+                .iter()
+                .enumerate()
+                .flat_map(|(k, sp)| [(k, false, sp[0]), (k, true, sp[1])])
+                .find_map(|(k, end, t)| ((tx(t) - p.x).abs() < 6.0).then_some((k, end)))
+        };
+
         let xp = tx(self.playhead);
         if xp >= r.left() && xp <= r.right() {
             painter.line_segment([pos2(xp, r.top()), pos2(xp, r.bottom())], Stroke::new(2.0_f32, Color32::from_rgb(255, 220, 60)));
@@ -1013,14 +1251,28 @@ impl Editor {
 
         // Мишка: IN/OUT маркерите се влачат, другаде — позиция.
         let near = |x: f32, p: Pos2| (x - p.x).abs() < 8.0 && p.y > wave.top();
+        let has_audio = self.info.has_audio;
+        let fade_at = |p: Pos2| fade_handles.iter().find(|(_, x)| has_audio && pos2(*x, fade_y).distance(p) < 8.0).map(|(d, _)| *d);
         if let Some(p) = resp.hover_pos() {
-            if self.drag == Drag::None && (near(xi, p) || near(xo, p)) {
+            if self.drag == Drag::None && (near(xi, p) || near(xo, p) || fade_at(p).is_some() || span_edge_at(p).is_some()) {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+            }
+            let fade = match self.drag {
+                Drag::FadeIn | Drag::FadeOut => Some(self.drag),
+                _ => fade_at(p),
+            };
+            if let Some(d) = fade {
+                let (name, v) = if d == Drag::FadeIn { ("Fade in", self.state.fade_in) } else { ("Fade out", self.state.fade_out) };
+                resp.clone().on_hover_text_at_pointer(format!("{name}: {v:.2} сек"));
             }
         }
         if resp.drag_started() {
             let p = ui.input(|i| i.pointer.press_origin()).unwrap_or_default();
-            self.drag = if near(xi, p) {
+            self.drag = if let Some(d) = fade_at(p) {
+                d
+            } else if let Some((k, end)) = span_edge_at(p) {
+                Drag::Span(k, end)
+            } else if near(xi, p) {
                 Drag::In
             } else if near(xo, p) {
                 Drag::Out
@@ -1043,6 +1295,30 @@ impl Editor {
                         self.set_out(t);
                         self.seek(self.state.out_t - self.frame_len());
                     }
+                    Drag::FadeIn => {
+                        let s = &mut self.state;
+                        s.fade_in = (t - s.in_t).clamp(0.0, (s.out_t - s.in_t - s.fade_out).max(0.0));
+                    }
+                    Drag::FadeOut => {
+                        let s = &mut self.state;
+                        s.fade_out = (s.out_t - t).clamp(0.0, (s.out_t - s.in_t - s.fade_in).max(0.0));
+                    }
+                    Drag::Span(k, end) => {
+                        let (fps, fl) = (self.info.fps, self.frame_len());
+                        let spans = self.selected.and_then(|i| self.state.masks.get_mut(i)).map(|m| &mut m.spans);
+                        if let Some(spans) = spans.filter(|s| k < s.len()) {
+                            let t = snap(t, fps);
+                            if end {
+                                let max = spans.get(k + 1).map_or(dur, |n| n[0]).max(spans[k][0] + fl);
+                                spans[k][1] = t.clamp(spans[k][0] + fl, max);
+                            } else {
+                                let min = if k > 0 { spans[k - 1][1] } else { 0.0 };
+                                spans[k][0] = t.clamp(min, (spans[k][1] - fl).max(min));
+                            }
+                            let edge = spans[k][usize::from(end)];
+                            self.seek(edge);
+                        }
+                    }
                     Drag::Playhead | Drag::None => self.seek(t),
                 }
             }
@@ -1055,6 +1331,15 @@ impl Editor {
         });
         ui.add_space(2.0);
     }
+}
+
+/// ЧЧ:ММ:СС:КК
+fn fmt_tc(t: f64, fps: f64) -> String {
+    let t = t.max(0.0) + 1e-6;
+    let secs = t.floor() as u64;
+    let fr = fps.round().max(1.0) as u64;
+    let ff = (((t - secs as f64) * fps).floor() as u64).min(fr - 1);
+    format!("{:02}:{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60, ff)
 }
 
 fn snap(t: f64, fps: f64) -> f64 {
@@ -1184,6 +1469,40 @@ mod tests {
         assert_eq!(m.points, before);
         let close = |a: &[[f32; 2]], b: &[[f32; 2]]| a.iter().zip(b).all(|(p, q)| (p[0] - q[0]).abs() < 1e-5 && (p[1] - q[1]).abs() < 1e-5);
         assert!(close(&m.effective(), &before));
+    }
+
+    #[test]
+    fn mask_show_hide() {
+        let mut m = Mask::new(Kind::Rect, vec![[0.1, 0.1], [0.2, 0.1], [0.2, 0.2]]);
+        assert!(m.active_at(0.0) && m.active_at(9.0));
+        // Скрий в 4 → видима 0–4.
+        m.hide_from(4.0, 10.0);
+        assert_eq!(m.spans, vec![[0.0, 4.0]]);
+        assert!(m.active_at(3.9) && !m.active_at(4.0));
+        // Покажи в 7 → и 7–10.
+        m.show_from(7.0, 10.0);
+        assert_eq!(m.spans, vec![[0.0, 4.0], [7.0, 10.0]]);
+        // Скрий в 8, после покажи в 5 → 5 се слива със следващия участък.
+        m.hide_from(8.0, 10.0);
+        m.show_from(5.0, 10.0);
+        assert_eq!(m.spans, vec![[0.0, 4.0], [5.0, 8.0]]);
+        // Скриване точно в началото на участък го премахва.
+        m.hide_from(0.0, 10.0);
+        assert_eq!(m.spans, vec![[5.0, 8.0]]);
+        m.hide_from(5.0, 10.0);
+        assert!(!m.spans.is_empty() && !(0..100).any(|k| m.active_at(k as f64 * 0.1)));
+        m.show_from(2.0, 10.0);
+        assert_eq!(m.spans, vec![[2.0, 10.0]]);
+    }
+
+    #[test]
+    fn fade_curve() {
+        assert_eq!(fade_gain(0.5, 1.0, 3.0, 0.5, 0.5), 1.0);
+        assert_eq!(fade_gain(1.0, 1.0, 3.0, 0.5, 0.5), 0.0);
+        assert!((fade_gain(1.25, 1.0, 3.0, 0.5, 0.5) - 0.7071).abs() < 1e-3);
+        assert_eq!(fade_gain(2.0, 1.0, 3.0, 0.5, 0.5), 1.0);
+        assert!(fade_gain(2.99, 1.0, 3.0, 0.5, 0.5) < 0.05);
+        assert_eq!(fade_gain(2.0, 1.0, 3.0, 0.0, 0.0), 1.0);
     }
 
     #[test]
