@@ -375,7 +375,73 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
     let out = unique_path(&task.opts.out_dir, &format!("{base} [{}]", task.label));
     let tmp = out.with_extension("part.mp4");
 
-    // 3. ffmpeg сваля само участъка и го записва като MP4.
+    // 3. Кодиране на изхода — еднакво при двата начина на сваляне.
+    let mut codec: Vec<String> = Vec::new();
+    if copy_video {
+        codec.extend(["-c:v", "copy", "-avoid_negative_ts", "make_zero"].map(String::from));
+    } else {
+        codec.extend(["-c:v", "libx264", "-preset", "medium", "-crf"].map(String::from));
+        codec.push(task.opts.crf.to_string());
+        codec.extend(["-pix_fmt", "yuv420p", "-profile:v", "high", "-g"].map(String::from));
+        // Ключов кадър всяка секунда — по-бързо превъртане в редактора.
+        codec.push(info["fps"].as_f64().map_or(25, |f| f.round().max(1.0) as u32).to_string());
+    }
+    if copy_audio {
+        codec.extend(["-c:a", "copy"].map(String::from));
+    } else {
+        codec.extend(["-c:a", "aac", "-b:a", "320k"].map(String::from));
+    }
+    codec.extend(["-movflags", "+faststart"].map(String::from));
+
+    set_info(format!("{fmt_desc} — сваляне…"), Some(0.0));
+    let progress = |p: f32| set_info(format!("{fmt_desc} — {:.0}%", p * 100.0), Some(p));
+    // YouTube връща 403 за линковете от `yt-dlp -J`, когато ги отвори друга програма —
+    // затова там участъкът го сваля самият yt-dlp (пак през ffmpeg, със същото кодиране).
+    let is_youtube = info["extractor_key"].as_str().is_some_and(|k| k.starts_with("Youtube"));
+    let result = if is_youtube {
+        let mut cmd = command(yt);
+        cmd.args(["--no-playlist", "--no-warnings", "--newline", "--force-overwrites", "--encoding", "utf-8", "-f"])
+            .arg(info["format_id"].as_str().unwrap_or("bv*+ba/b"))
+            .arg("--download-sections")
+            .arg(format!("*{start:.3}-{cut_end:.3}"))
+            .args(["--downloader", "ffmpeg", "--merge-output-format", "mp4", "--ffmpeg-location"])
+            .arg(ff.parent().unwrap_or(Path::new(".")))
+            .arg("--downloader-args")
+            .arg(format!("ffmpeg_o:{}", codec.join(" ")))
+            .arg("-o")
+            .arg(&tmp)
+            .arg(&task.url);
+        run_ytdlp_download(cmd, dur, cancel, progress)
+    } else {
+        run_direct(ff, &streams, vi, ai, start, dur, &codec, &tmp, cancel, progress)
+    };
+    // Начало след края на видеото: ffmpeg завършва „успешно“ с празен MP4 без нито един кадър.
+    let result = result.and_then(|()| {
+        let has_video = crate::media::probe(ff, &tmp).is_ok_and(|i| i.duration > 0.0 && i.width > 0);
+        if has_video { Ok(()) } else { Err("Не е свален нито един кадър — началото вероятно е след края на видеото.".to_string()) }
+    });
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, &out).map_err(|e| format!("Преименуване: {e}"))?;
+    Ok(out)
+}
+
+/// ffmpeg сваля участъка направо от линковете на потоците.
+#[allow(clippy::too_many_arguments)]
+fn run_direct(
+    ff: &Path,
+    streams: &[Stream],
+    vi: usize,
+    ai: Option<usize>,
+    start: f64,
+    dur: f64,
+    codec: &[String],
+    tmp: &Path,
+    cancel: &AtomicBool,
+    on_progress: impl Fn(f32),
+) -> Result<(), String> {
     let mut cmd = command(ff);
     cmd.args(["-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-progress", "pipe:1", "-nostats"]);
     let used: Vec<usize> = match ai {
@@ -399,35 +465,67 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
         Some(_) => cmd.args(["-map", "0:a:0"]),
         None => &mut cmd,
     };
-    if copy_video {
-        cmd.args(["-c:v", "copy", "-avoid_negative_ts", "make_zero"]);
-    } else {
-        cmd.args(["-c:v", "libx264", "-preset", "medium", "-crf"])
-            .arg(task.opts.crf.to_string())
-            .args(["-pix_fmt", "yuv420p", "-profile:v", "high", "-g"])
-            // Ключов кадър всяка секунда — по-бързо превъртане в редактора.
-            .arg(info["fps"].as_f64().map_or(25, |f| f.round().max(1.0) as u32).to_string());
-    }
-    if copy_audio {
-        cmd.args(["-c:a", "copy"]);
-    } else {
-        cmd.args(["-c:a", "aac", "-b:a", "320k"]);
-    }
-    cmd.args(["-movflags", "+faststart", "-f", "mp4"]).arg(&tmp);
+    cmd.args(codec).args(["-f", "mp4"]).arg(tmp);
+    run_ffmpeg(cmd, dur, cancel, on_progress)
+}
 
-    set_info(format!("{fmt_desc} — сваляне…"), Some(0.0));
-    let result = run_ffmpeg(cmd, dur, cancel, |p| set_info(format!("{fmt_desc} — {:.0}%", p * 100.0), Some(p)));
-    // Начало след края на видеото: ffmpeg завършва „успешно“ с празен MP4 без нито един кадър.
-    let result = result.and_then(|()| {
-        let has_video = crate::media::probe(ff, &tmp).is_ok_and(|i| i.duration > 0.0 && i.width > 0);
-        if has_video { Ok(()) } else { Err("Не е свален нито един кадър — началото вероятно е след края на видеото.".to_string()) }
-    });
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+/// yt-dlp сваля участъка; напредъкът е от редовете на ffmpeg („time=ЧЧ:ММ:СС.сс“).
+fn run_ytdlp_download(mut cmd: Command, dur: f64, cancel: &AtomicBool, on_progress: impl Fn(f32)) -> Result<(), String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("yt-dlp не може да се стартира: {e}"))?;
+    let (tx, rx) = mpsc::channel::<String>();
+    // yt-dlp пише своите съобщения в stdout, а редовете на ffmpeg (разделени с \r) — в stderr.
+    for pipe in [Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>, Box::new(child.stderr.take().unwrap())] {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for chunk in BufReader::new(pipe).split(b'\r').map_while(Result::ok) {
+                for line in String::from_utf8_lossy(&chunk).lines() {
+                    if tx.send(line.to_string()).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
     }
-    std::fs::rename(&tmp, &out).map_err(|e| format!("Преименуване: {e}"))?;
-    Ok(out)
+    drop(tx);
+    let mut last: VecDeque<String> = VecDeque::new();
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CANCELLED.into());
+        }
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(150)) {
+            if let Some(t) = line.split("time=").nth(1).and_then(|r| parse_hms(r.split_whitespace().next()?)) {
+                on_progress((t / dur).clamp(0.0, 1.0) as f32);
+            }
+            if !line.trim().is_empty() {
+                last.push_back(line);
+                if last.len() > 40 {
+                    last.pop_front();
+                }
+            }
+        }
+        if let Ok(Some(s)) = child.try_wait() {
+            break s;
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    // Най-полезни са редовете с ERROR от yt-dlp; иначе последните.
+    let errors: Vec<&String> = last.iter().filter(|l| l.contains("ERROR") || l.contains("Error")).collect();
+    let text = if errors.is_empty() { tail(&Vec::from(last).join("\n"), 4) } else { errors.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n") };
+    Err(format!("yt-dlp: {text}"))
+}
+
+/// „00:01:02.50“ → секунди.
+fn parse_hms(s: &str) -> Option<f64> {
+    let mut t = 0.0;
+    for part in s.split(':') {
+        t = t * 60.0 + part.parse::<f64>().ok()?;
+    }
+    Some(t)
 }
 
 const BROWSER_UA: &str =
@@ -643,6 +741,26 @@ mod tests {
             println!("precise={precise}: {r:?} / {}", task.state.lock().unwrap().info);
             assert!(r.unwrap().is_file());
         }
+    }
+
+    /// YouTube: линковете от `yt-dlp -J` връщат 403 на ffmpeg — участъкът се сваля през yt-dlp.
+    #[test]
+    #[ignore]
+    fn download_youtube_via_ytdlp() {
+        let task = Task {
+            url: "https://www.youtube.com/watch?v=qQUfNO7UaLE".into(),
+            name: String::new(),
+            cut_start: 60,
+            cut_end: 75,
+            label: "yt403".into(),
+            marks: (5.0, 10.0),
+            opts: Options { out_dir: std::env::temp_dir().join("pp_downloader_test"), precise: true, max_res: 0, crf: 16 },
+            state: Default::default(),
+        };
+        let r = process(&task, &Tools::find(), &AtomicBool::new(false), &eframe::egui::Context::default());
+        println!("youtube: {r:?} / {}", task.state.lock().unwrap().info);
+        let info = crate::media::probe(&Tools::find().ffmpeg.unwrap(), &r.unwrap()).unwrap();
+        assert!((info.duration - 15.0).abs() < 0.2 && info.has_audio, "duration {}", info.duration);
     }
 
     /// bntnews.bg: yt-dlp връща списък (видео + .mp3 „прочети статията“) — трябва да се вземе видеото.
