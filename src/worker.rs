@@ -285,8 +285,8 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
     // Сайтове без собствен модул в yt-dlp (напр. bnt.bg): видеото се търси в HTML-а на страницата.
     // Защитната стена на bnt.bg (FortiWeb) пропуска само заявки, които изглеждат като от браузър:
     // пълен User-Agent, Referer и бисквитката от страницата — същото, което праща разширението в браузъра.
-    let (info, page_title, cookie) = match resolve(yt, &task.url, &sort, None, cancel) {
-        Ok(info) => (info, None, String::new()),
+    let (info, page_title, cookie, source) = match resolve(yt, &task.url, &sort, None, cancel) {
+        Ok(info) => (info, None, String::new(), task.url.clone()),
         Err(e) if e.contains("Unsupported URL") => {
             let (html, cookie) = fetch_page(&task.url, cancel)?;
             let html = html.replace("\\/", "/");
@@ -297,9 +297,23 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
                     format!("Не е намерено видео на страницата ({e})")
                 }
             })?;
-            (resolve(yt, &media, &sort, Some(&task.url), cancel)?, find_og_title(&html), cookie)
+            let info = resolve(yt, &media, &sort, Some(&task.url), cancel).map_err(|e| format!("{e}
+(видео от страницата: {media})"))?;
+            (info, find_og_title(&html), cookie, media)
         }
         Err(e) => return Err(e),
+    };
+    // Страница с няколко вградени видеа: yt-dlp връща списък — взима се първото с видео.
+    // Заглавието е на страницата: на елементите yt-dlp добавя номер „ (1)“.
+    let page_title = page_title.or_else(|| info["entries"].is_array().then(|| info["title"].as_str().map(str::to_string)).flatten());
+    let info = match info["entries"].as_array() {
+        Some(entries) => entries
+            .iter()
+            .find(|e| e["requested_formats"].is_array() || e["vcodec"].as_str().is_some_and(|v| v != "none"))
+            .or_else(|| entries.first())
+            .cloned()
+            .ok_or(format!("На страницата няма видео ({source})"))?,
+        None => info,
     };
 
     let mut streams: Vec<Stream> = match info["requested_formats"].as_array() {
@@ -332,7 +346,7 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
             }
         }
     }
-    let vi = streams.iter().position(Stream::has_video).ok_or("Не е намерен видео поток")?;
+    let vi = streams.iter().position(Stream::has_video).ok_or(format!("Не е намерен видео поток ({source})"))?;
     let ai = streams.iter().position(|s| s.has_audio() && !s.has_video()).or_else(|| streams[vi].has_audio().then_some(vi));
 
     let mut cut_end = task.cut_end as f64;
@@ -629,6 +643,26 @@ mod tests {
             println!("precise={precise}: {r:?} / {}", task.state.lock().unwrap().info);
             assert!(r.unwrap().is_file());
         }
+    }
+
+    /// bntnews.bg: yt-dlp връща списък (видео + .mp3 „прочети статията“) — трябва да се вземе видеото.
+    #[test]
+    #[ignore]
+    fn download_from_playlist_page() {
+        let task = Task {
+            url: "https://bntnews.bg/news/kralski-rozhden-den-princ-lui-navarshi-sedem-godini-1336087news.html".into(),
+            name: String::new(),
+            cut_start: 2,
+            cut_end: 12,
+            label: "playlist".into(),
+            marks: (1.0, 9.0),
+            opts: Options { out_dir: std::env::temp_dir().join("pp_downloader_test"), precise: true, max_res: 0, crf: 16 },
+            state: Default::default(),
+        };
+        let r = process(&task, &Tools::find(), &AtomicBool::new(false), &eframe::egui::Context::default());
+        println!("playlist: {r:?} / {}", task.state.lock().unwrap().info);
+        let info = crate::media::probe(&Tools::find().ffmpeg.unwrap(), &r.unwrap()).unwrap();
+        assert!(info.width > 0 && info.duration > 5.0);
     }
 
     /// Начало след края на директен .mp4 от bnt.bg (yt-dlp не знае дължината) → грешка, не празен файл.
