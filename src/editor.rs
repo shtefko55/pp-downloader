@@ -173,6 +173,18 @@ pub fn fade_gain(t: f64, in_t: f64, out_t: f64, fade_in: f64, fade_out: f64) -> 
     (a * b) as f32
 }
 
+/// Свален клип от проекта — за списъка в редактора.
+#[derive(Clone)]
+pub struct ClipRef {
+    pub path: PathBuf,
+    /// „3. Име“
+    pub label: String,
+    /// Таймкодове или „видео от диска“.
+    pub detail: String,
+    pub edited: bool,
+    pub exported: bool,
+}
+
 /// Какво чертае влаченето в картината.
 #[derive(Clone, Copy, PartialEq)]
 enum Tool {
@@ -247,6 +259,12 @@ pub struct Editor {
 
     export: Arc<Mutex<ExportStatus>>,
     export_cancel: Arc<AtomicBool>,
+
+    /// Свалените клипове на проекта; изборът на друг се записва в `switch_to`.
+    clips: Vec<ClipRef>,
+    pub switch_to: Option<PathBuf>,
+    pub switch_error: String,
+    clip_scrolled: bool,
 }
 
 impl Editor {
@@ -294,7 +312,11 @@ impl Editor {
         fetcher.request(state.in_t);
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         Ok(Editor {
-            viewport: egui::ViewportId::from_hash_of(("editor", &path)),
+            // Уникален за всеки прозорец: при смяна на клипа новият редактор наследява прозореца.
+            viewport: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                egui::ViewportId::from_hash_of(("editor", NEXT.fetch_add(1, Ordering::Relaxed)))
+            },
             path,
             name,
             ffmpeg,
@@ -331,6 +353,10 @@ impl Editor {
             mask_cache: Vec::new(),
             drag: Drag::None,
             export: Default::default(),
+            clips: Vec::new(),
+            switch_to: None,
+            switch_error: String::new(),
+            clip_scrolled: false,
             export_cancel: Default::default(),
         })
     }
@@ -339,7 +365,8 @@ impl Editor {
         self.export.lock().unwrap().running
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) {
+    pub fn show(&mut self, ctx: &egui::Context, clips: &[ClipRef]) {
+        self.clips = clips.to_vec();
         let builder = egui::ViewportBuilder::default()
             .with_title(format!("Редакция — {}", self.name))
             .with_inner_size([1320.0, 900.0])
@@ -354,7 +381,15 @@ impl Editor {
             self.update_texture(ctx);
             egui::SidePanel::right(egui::Id::new(("ed_side", id)))
                 .exact_width(300.0)
-                .show(ctx, |ui| self.masks_ui(ui));
+                .show(ctx, |ui| {
+                    if self.clips.len() > 1 {
+                        egui::TopBottomPanel::bottom(egui::Id::new(("ed_clips", id)))
+                            .resizable(true)
+                            .default_height(280.0)
+                            .show_inside(ui, |ui| self.clips_ui(ui));
+                    }
+                    egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| self.masks_ui(ui));
+                });
             // Бутоните и таймкодовете стоят точно над waveform-а.
             egui::TopBottomPanel::bottom(egui::Id::new(("ed_timeline", id))).show(ctx, |ui| {
                 self.toolbar_ui(ui);
@@ -518,6 +553,14 @@ impl Editor {
         let home = take(Modifiers::NONE, Key::Home);
         let end = take(Modifiers::NONE, Key::End);
         let del = take(Modifiers::NONE, Key::Delete);
+        let prev_clip = take(Modifiers::NONE, Key::PageUp);
+        let next_clip = take(Modifiers::NONE, Key::PageDown);
+        if (prev_clip || next_clip) && !self.exporting() {
+            if let Some(i) = self.clips.iter().position(|c| c.path == self.path) {
+                let j = if next_clip { i + 1 } else { i.wrapping_sub(1) };
+                self.switch_to = self.clips.get(j).map(|c| c.path.clone());
+            }
+        }
         let esc = take(Modifiers::NONE, Key::Escape);
         if space {
             self.toggle_play();
@@ -918,6 +961,51 @@ impl Editor {
             }
             ctx.request_repaint_of(eframe::egui::ViewportId::ROOT);
         });
+    }
+
+    fn clips_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.heading(format!("Клипове ({})", self.clips.len()));
+            ui.weak("PgUp / PgDn");
+        });
+        let busy = self.exporting();
+        if busy {
+            ui.weak("Изчакай експорта, за да смениш клипа.");
+        }
+        if !self.switch_error.is_empty() {
+            ui.colored_label(Color32::from_rgb(220, 60, 60), &self.switch_error);
+        }
+        let mut pick = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            for c in &self.clips {
+                let current = c.path == self.path;
+                let mut marks = Vec::new();
+                if c.edited {
+                    marks.push("✂");
+                }
+                if c.exported {
+                    marks.push("✔ експортиран");
+                }
+                let mut text = egui::RichText::new(format!("{}\n{}   {}", c.label, c.detail, marks.join("  ")));
+                if current {
+                    text = text.strong();
+                }
+                let r = ui
+                    .add_enabled(!busy, egui::SelectableLabel::new(current, text))
+                    .on_hover_text(c.path.file_name().unwrap_or_default().to_string_lossy());
+                if current && !self.clip_scrolled {
+                    r.scroll_to_me(Some(egui::Align::Center));
+                    self.clip_scrolled = true;
+                }
+                if r.clicked() && !current {
+                    pick = Some(c.path.clone());
+                }
+            }
+        });
+        if pick.is_some() {
+            self.switch_to = pick;
+        }
     }
 
     fn masks_ui(&mut self, ui: &mut egui::Ui) {
@@ -1442,7 +1530,7 @@ fn point_in_poly(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
 }
 
 /// Името на клипа без добавените от програмата таймкодове „ [ЧЧ-ММ-СС_ЧЧ-ММ-СС]“.
-fn clean_name(stem: &str) -> String {
+pub fn clean_name(stem: &str) -> String {
     match stem.rfind(" [") {
         Some(i) if stem.ends_with(']') => stem[..i].trim().to_string(),
         _ => stem.to_string(),

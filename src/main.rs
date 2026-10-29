@@ -600,18 +600,66 @@ impl App {
             ctx.send_viewport_cmd_to(e.viewport, egui::ViewportCommand::Focus);
             return;
         }
-        let Some(ffmpeg) = self.tools.ffmpeg.clone() else {
-            self.editor_msg = "Липсва ffmpeg.exe".into();
-            return;
-        };
-        let marks = marks.filter(|(a, b)| b > a);
-        match Editor::open(path, ffmpeg, self.saved.settings.crf, edit, marks, self.project.exports_dir(), ctx) {
+        match self.new_editor(path, marks, edit, ctx) {
             Ok(e) => {
                 self.editor_msg.clear();
                 self.editors.push(e);
             }
-            Err(e) => self.editor_msg = format!("Видеото не може да се отвори: {e}"),
+            Err(e) => self.editor_msg = e,
         }
+    }
+
+    fn new_editor(&self, path: PathBuf, marks: Option<(f64, f64)>, edit: Option<EditState>, ctx: &egui::Context) -> Result<Editor, String> {
+        let ffmpeg = self.tools.ffmpeg.clone().ok_or("Липсва ffmpeg.exe")?;
+        let marks = marks.filter(|(a, b)| b > a);
+        Editor::open(path, ffmpeg, self.saved.settings.crf, edit, marks, self.project.exports_dir(), ctx)
+            .map_err(|e| format!("Видеото не може да се отвори: {e}"))
+    }
+
+    /// Редакторът `idx` зарежда друг клип от проекта в същия прозорец; редакцията на текущия се пази.
+    fn switch_editor(&mut self, idx: usize, path: PathBuf, ctx: &egui::Context) {
+        if let Some(other) = self.editors.iter().find(|e| e.path == path) {
+            ctx.send_viewport_cmd_to(other.viewport, egui::ViewportCommand::Focus);
+            return;
+        }
+        self.store_edits();
+        let Some(job) = self.project.jobs.iter().find(|j| j.done.as_ref().is_some_and(|d| d.0 == path)) else { return };
+        let (marks, edit) = (job.done.as_ref().map(|d| (d.1, d.2)), job.edit.clone());
+        match self.new_editor(path, marks, edit, ctx) {
+            Ok(mut e) => {
+                e.viewport = self.editors[idx].viewport;
+                self.editors[idx] = e;
+            }
+            Err(e) => self.editors[idx].switch_error = e,
+        }
+    }
+
+    /// Свалените клипове на проекта, номерирани като в главния списък.
+    fn clip_refs(&self) -> Vec<editor::ClipRef> {
+        self.project
+            .jobs
+            .iter()
+            .enumerate()
+            .filter(|(_, j)| j.state.lock().unwrap().status == Status::Done)
+            .filter_map(|(i, j)| {
+                let path = j.done.as_ref()?.0.clone();
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                let name = if j.name.trim().is_empty() { editor::clean_name(&stem) } else { j.name.trim().to_string() };
+                let name: String = if name.chars().count() > 34 { name.chars().take(33).chain(['…']).collect() } else { name };
+                let detail = if j.url.trim().is_empty() {
+                    "видео от диска".to_string()
+                } else {
+                    format!("{} – {}", fmt_secs(j.start.secs()), fmt_secs(j.end.secs()))
+                };
+                Some(editor::ClipRef {
+                    path,
+                    label: format!("{}. {name}", i + 1),
+                    detail,
+                    edited: j.edit.is_some(),
+                    exported: j.edit.as_ref().is_some_and(|e| e.exported.is_some()),
+                })
+            })
+            .collect()
     }
 
     /// Видео от диска: ако вече е в проекта — отваря неговата редакция, иначе го добавя.
@@ -1105,8 +1153,14 @@ impl eframe::App for App {
         });
 
         self.quick_ui(ctx);
+        let clips = self.clip_refs();
         for e in &mut self.editors {
-            e.show(ctx);
+            e.show(ctx, &clips);
+        }
+        let switches: Vec<(usize, PathBuf)> =
+            self.editors.iter_mut().enumerate().filter_map(|(i, e)| Some((i, e.switch_to.take()?))).collect();
+        for (i, path) in switches {
+            self.switch_editor(i, path, ctx);
         }
         if self.editors.iter().any(|e| !e.open) {
             self.store_edits();
