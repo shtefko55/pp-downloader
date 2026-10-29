@@ -490,6 +490,7 @@ impl App {
                 self.quick.cancel.store(true, Ordering::SeqCst);
             }
             let handles = self.saved.settings.handles;
+            let editor_msg = self.editor_msg.clone();
             let q = &mut self.quick;
             let working = q.working();
             let (status, progress, info, marks) = {
@@ -543,6 +544,9 @@ impl App {
                     }
                     Status::Done => {
                         ui.colored_label(egui::Color32::from_rgb(40, 170, 80), format!("✔ {info}"));
+                        if !editor_msg.is_empty() {
+                            ui.colored_label(egui::Color32::from_rgb(220, 60, 60), &editor_msg);
+                        }
                         ui.horizontal(|ui| {
                             if let Some(p) = q.output() {
                                 let label = if q.edit.is_some() { "✂ Редактирай (има промени)" } else { "✂ Редактирай" };

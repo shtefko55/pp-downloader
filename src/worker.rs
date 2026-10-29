@@ -313,9 +313,11 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
     }
     // Директен файл: yt-dlp не знае кодеците, питаме ffprobe.
     let mut height = info["height"].as_u64();
+    let mut duration = info["duration"].as_f64();
     if let [s] = streams.as_mut_slice() {
         if s.vcodec.is_empty() {
             if let Some(probe) = probe(ff, s, cancel) {
+                duration = duration.or(probe["format"]["duration"].as_str().and_then(|d| d.parse().ok()));
                 for st in probe["streams"].as_array().into_iter().flatten() {
                     let name = st["codec_name"].as_str().unwrap_or("").to_string();
                     match st["codec_type"].as_str() {
@@ -334,7 +336,7 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
     let ai = streams.iter().position(|s| s.has_audio() && !s.has_video()).or_else(|| streams[vi].has_audio().then_some(vi));
 
     let mut cut_end = task.cut_end as f64;
-    if let Some(d) = info["duration"].as_f64() {
+    if let Some(d) = duration {
         if task.cut_start as f64 >= d {
             return Err(format!("Началото е след края на видеото ({})", fmt_secs(d as u32)));
         }
@@ -401,6 +403,11 @@ fn process_once(task: &Task, tools: &Tools, cancel: &AtomicBool, ctx: &eframe::e
 
     set_info(format!("{fmt_desc} — сваляне…"), Some(0.0));
     let result = run_ffmpeg(cmd, dur, cancel, |p| set_info(format!("{fmt_desc} — {:.0}%", p * 100.0), Some(p)));
+    // Начало след края на видеото: ffmpeg завършва „успешно“ с празен MP4 без нито един кадър.
+    let result = result.and_then(|()| {
+        let has_video = crate::media::probe(ff, &tmp).is_ok_and(|i| i.duration > 0.0 && i.width > 0);
+        if has_video { Ok(()) } else { Err("Не е свален нито един кадър — началото вероятно е след края на видеото.".to_string()) }
+    });
     if let Err(e) = result {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -492,7 +499,7 @@ fn find_media_url(html: &str, page_url: &str) -> Option<String> {
 
 fn probe(ff: &Path, s: &Stream, cancel: &AtomicBool) -> Option<Value> {
     let mut cmd = command(&ff.with_file_name("ffprobe.exe"));
-    cmd.args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,height", "-of", "json"]);
+    cmd.args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,height:format=duration", "-of", "json"]);
     if s.url.starts_with("http") && !s.headers.is_empty() {
         cmd.arg("-headers").arg(&s.headers);
     }
@@ -622,5 +629,26 @@ mod tests {
             println!("precise={precise}: {r:?} / {}", task.state.lock().unwrap().info);
             assert!(r.unwrap().is_file());
         }
+    }
+
+    /// Начало след края на директен .mp4 от bnt.bg (yt-dlp не знае дължината) → грешка, не празен файл.
+    #[test]
+    #[ignore]
+    fn download_past_end() {
+        let tools = Tools::find();
+        let out_dir = std::env::temp_dir().join("pp_downloader_test");
+        let task = Task {
+            url: "https://bnt.bg/news/po-sveta-i-u-nas-900-chasa-21-oktomvri-2026-g-352171news.html".into(),
+            name: "past_end".into(),
+            cut_start: 20000,
+            cut_end: 20030,
+            label: "past_end".into(),
+            marks: (5.0, 25.0),
+            opts: Options { out_dir: out_dir.clone(), precise: false, max_res: 0, crf: 16 },
+            state: Default::default(),
+        };
+        let r = process(&task, &tools, &AtomicBool::new(false), &eframe::egui::Context::default());
+        println!("past end: {r:?}");
+        assert!(r.is_err_and(|e| e.contains("след края")));
     }
 }
