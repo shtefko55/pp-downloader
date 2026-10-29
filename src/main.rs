@@ -73,9 +73,10 @@ struct Settings {
     precise: bool,
     max_res: u32,
     crf: u32,
-    /// Таймкодът се пише на ръка (иначе — падащи менюта).
+    /// Таймкодът се избира от падащи менюта; по подразбиране се пише на ръка.
+    /// (Ново име на полето: старото `tc_typed` от v0.3.5 се пренебрегва, за да стане ръчният режим подразбиращ се за всички.)
     #[serde(default)]
-    tc_typed: bool,
+    tc_menu: bool,
 }
 
 impl Default for Settings {
@@ -88,7 +89,7 @@ impl Default for Settings {
             precise: true,
             max_res: 0,
             crf: 16,
-            tc_typed: false,
+            tc_menu: false,
         }
     }
 }
@@ -501,7 +502,7 @@ impl App {
                 self.quick.cancel.store(true, Ordering::SeqCst);
             }
             let handles = self.saved.settings.handles;
-            let typed = self.saved.settings.tc_typed;
+            let typed = !self.saved.settings.tc_menu;
             let editor_msg = self.editor_msg.clone();
             let q = &mut self.quick;
             let working = q.working();
@@ -888,15 +889,15 @@ impl App {
             }
             ui.separator();
             ui.label("Таймкод:");
-            ui.selectable_value(&mut s.tc_typed, false, "▼ Меню").on_hover_text("Часове, минути и секунди от падащи менюта");
-            ui.selectable_value(&mut s.tc_typed, true, "⌨ Ръчно")
+            ui.selectable_value(&mut s.tc_menu, false, "⌨ Ръчно")
                 .on_hover_text("Пишеш цифрите направо; 9 = 09. Tab минава към следващото поле.");
+            ui.selectable_value(&mut s.tc_menu, true, "▼ Меню").on_hover_text("Часове, минути и секунди от падащи менюта");
         });
     }
 
     fn jobs_ui(&mut self, ui: &mut egui::Ui) {
         let handles = self.saved.settings.handles;
-        let typed = self.saved.settings.tc_typed;
+        let typed = !self.saved.settings.tc_menu;
         let mut show_log = None;
         let mut remove = None;
         let mut duplicate = None;
@@ -1142,10 +1143,11 @@ fn tc_ui(ui: &mut egui::Ui, id: (&str, u64), label: &str, tc: &mut Tc, typed: bo
             .response
             .on_hover_text(hint);
     };
+    ui.weak("ч");
     combo(ui, "h", &mut tc.h, 23, "часове");
-    ui.label(":");
+    ui.weak("м");
     combo(ui, "m", &mut tc.m, 59, "минути");
-    ui.label(":");
+    ui.weak("с");
     combo(ui, "s", &mut tc.s, 59, "секунди");
 
     let text_id = egui::Id::new((id, "text"));
