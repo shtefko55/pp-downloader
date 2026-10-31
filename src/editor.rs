@@ -156,6 +156,24 @@ pub struct EditState {
 }
 
 impl EditState {
+    /// Откъсът е сменен с нов таймкод: IN/OUT стават новите граници, а маските се местят
+    /// с `shift` секунди (новото начало на файла е с толкова по-рано), за да останат върху същите кадри.
+    pub fn retime(&mut self, shift: f64, in_t: f64, out_t: f64) {
+        self.in_t = in_t;
+        self.out_t = out_t;
+        self.masks.retain_mut(|m| {
+            if m.spans.is_empty() {
+                return true; // през целия клип
+            }
+            m.spans.retain_mut(|s| {
+                *s = [(s[0] + shift).max(0.0), s[1] + shift];
+                s[1] > s[0]
+            });
+            // Всичките ѝ участъци са извън новия откъс — иначе празното би значело „през целия клип“.
+            !m.spans.is_empty()
+        });
+    }
+
     /// Усилване на звука в момент `t` от клипа (извън IN–OUT: 1).
     pub fn gain_at(&self, t: f64) -> f32 {
         fade_gain(t, self.in_t, self.out_t, self.fade_in, self.fade_out)

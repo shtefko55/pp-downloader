@@ -939,11 +939,21 @@ impl App {
                     });
                     if !imported {
                         ui.horizontal(|ui| {
+                            let old_start = job.start;
                             let changed_a = tc_ui(ui, ("start", job.id), "Начало:", &mut job.start, typed);
                             ui.add_space(16.0);
                             let changed_b = tc_ui(ui, ("end", job.id), "Край:", &mut job.end, typed);
                             if (changed_a || changed_b) && matches!(status, Status::Done | Status::Failed | Status::Cancelled) {
                                 *job.state.lock().unwrap() = Default::default();
+                            }
+                            // Запазената редакция е за стария откъс: без това редакторът би отворил
+                            // новия файл със старите IN/OUT и експортът би спрял на стария край.
+                            if changed_a || changed_b {
+                                if let Some(e) = &mut job.edit {
+                                    let (old_cut, cut) = (old_start.secs().saturating_sub(handles), job.start.secs().saturating_sub(handles));
+                                    let (a, b) = (job.start.secs() - cut, job.end.secs().saturating_sub(cut));
+                                    e.retime(old_cut as f64 - cut as f64, a as f64, b as f64);
+                                }
                             }
                             ui.add_space(16.0);
                             let (a, b) = (job.start.secs(), job.end.secs());
