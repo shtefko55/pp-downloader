@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const CANCELLED: &str = "Спряно";
+pub(crate) const CANCELLED: &str = "Спряно";
 
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub enum Status {

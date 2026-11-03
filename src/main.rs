@@ -5,6 +5,9 @@ mod editor;
 mod export;
 mod media;
 mod project;
+mod assoc;
+mod track;
+mod winshow;
 mod updater;
 mod worker;
 
@@ -77,6 +80,9 @@ struct Settings {
     /// (Ново име на полето: старото `tc_typed` от v0.3.5 се пренебрегва, за да стане ръчният режим подразбиращ се за всички.)
     #[serde(default)]
     tc_menu: bool,
+    /// До часовете/минутите/секундите има и поле за целия таймкод наведнъж („1:23:45“). По подразбиране е скрито.
+    #[serde(default)]
+    tc_text: bool,
 }
 
 impl Default for Settings {
@@ -90,6 +96,7 @@ impl Default for Settings {
             max_res: 0,
             crf: 16,
             tc_menu: false,
+            tc_text: false,
         }
     }
 }
@@ -109,6 +116,11 @@ struct Saved {
     next_id: u64,
     #[serde(default)]
     edits: HashMap<String, EditState>,
+    /// Как са били затворени основният прозорец и прозорецът „Редакция“.
+    #[serde(default)]
+    main_win: Option<winshow::Place>,
+    #[serde(default)]
+    editor_win: Option<winshow::Place>,
 }
 
 /// Отделен прозорец за бързо сваляне на един откъс, без да се пипа списъкът на проекта.
@@ -141,6 +153,9 @@ impl Quick {
 }
 
 struct App {
+    /// Прозорецът е създаден скрит; след първия кадър се показва както е бил затворен.
+    shown: bool,
+    hwnd: isize,
     saved: Saved,
     quick: Quick,
     project: Project,
@@ -160,7 +175,6 @@ struct App {
     app_update: Arc<Mutex<updater::UpdateState>>,
     scroll_to_add: bool,
     /// Размерът на прозореца се проверява в първите кадри след пускане.
-    size_checks: u32,
     /// Отворен лог на грешка: (заглавие, текст).
     log_view: Option<(String, String)>,
 }
@@ -225,6 +239,8 @@ impl App {
         }
 
         let mut app = App {
+            shown: false,
+            hwnd: 0,
             saved,
             quick: Quick::default(),
             project,
@@ -242,15 +258,21 @@ impl App {
             update_msg: Default::default(),
             app_update: Default::default(),
             scroll_to_add: false,
-            size_checks: 0,
             log_view: None,
         };
         app.project_opened();
         updater::cleanup();
         app.check_for_update(&cc.egui_ctx);
-        // Видео, пуснато върху PP_Downloader.exe, се отваря направо в редактора.
+        // Проектните файлове .ppdl с иконата на програмата и отваряне с двоен клик.
+        std::thread::spawn(assoc::register);
+        // Проект (.ppdl) се отваря като проект; видео, пуснато върху PP_Downloader.exe — направо в редактора.
         if let Some(file) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
-            app.open_file(file, &cc.egui_ctx);
+            if file.extension().is_some_and(|e| e.eq_ignore_ascii_case(project::EXT)) {
+                let result = Project::load(&file);
+                app.switch_project(result);
+            } else {
+                app.open_file(file, &cc.egui_ctx);
+            }
         }
         app
     }
@@ -503,6 +525,7 @@ impl App {
             }
             let handles = self.saved.settings.handles;
             let typed = !self.saved.settings.tc_menu;
+            let tc_text = self.saved.settings.tc_text;
             let editor_msg = self.editor_msg.clone();
             let q = &mut self.quick;
             let working = q.working();
@@ -519,15 +542,15 @@ impl App {
                         let mut changed = false;
                         ui.horizontal(|ui| {
                             let w = (ui.available_width() - 210.0).max(200.0);
-                            let r = ui.add(egui::TextEdit::singleline(&mut q.url).hint_text("Линк (YouTube, bnt.bg …)").desired_width(w));
+                            let r = framed_text(ui, egui::TextEdit::singleline(&mut q.url).hint_text("Линк (YouTube, bnt.bg …)").desired_width(w));
                             changed |= r.changed() | edit_menu(&r, &mut q.url);
-                            let n = ui.add(egui::TextEdit::singleline(&mut q.name).hint_text("Име на файла (по избор)").desired_width(200.0));
+                            let n = framed_text(ui, egui::TextEdit::singleline(&mut q.name).hint_text("Име на файла (по избор)").desired_width(200.0));
                             edit_menu(&n, &mut q.name);
                         });
                         ui.horizontal(|ui| {
-                            changed |= tc_ui(ui, ("qstart", 0), "Начало:", &mut q.start, typed);
+                            changed |= tc_ui(ui, ("qstart", 0), "Начало:", &mut q.start, typed, tc_text);
                             ui.add_space(16.0);
-                            changed |= tc_ui(ui, ("qend", 0), "Край:", &mut q.end, typed);
+                            changed |= tc_ui(ui, ("qend", 0), "Край:", &mut q.end, typed, tc_text);
                             ui.add_space(16.0);
                             let (a, b) = (q.start.secs(), q.end.secs());
                             if b > a {
@@ -564,7 +587,7 @@ impl App {
                         }
                         ui.horizontal(|ui| {
                             if let Some(p) = q.output() {
-                                let label = if q.edit.is_some() { "✂ Редактирай (има промени)" } else { "✂ Редактирай" };
+                                let label = "✂ Редактирай";
                                 if ui.add(colored_button(label, PURPLE).min_size(egui::vec2(0.0, 28.0))).clicked() {
                                     edit = Some((p.clone(), marks, q.edit.clone()));
                                 }
@@ -660,8 +683,9 @@ impl App {
             return;
         }
         match self.new_editor(path, marks, edit, ctx) {
-            Ok(e) => {
+            Ok(mut e) => {
                 self.editor_msg.clear();
+                e.place = self.saved.editor_win;
                 self.editors.push(e);
             }
             Err(e) => self.editor_msg = e,
@@ -687,6 +711,9 @@ impl App {
         match self.new_editor(path, marks, edit, ctx) {
             Ok(mut e) => {
                 e.viewport = self.editors[idx].viewport;
+                // Прозорецът вече съществува — остава какъвто е.
+                let old = &self.editors[idx];
+                (e.shown, e.hwnd, e.place) = (true, old.hwnd, old.place);
                 self.editors[idx] = e;
             }
             Err(e) => self.editors[idx].switch_error = e,
@@ -892,12 +919,15 @@ impl App {
             ui.selectable_value(&mut s.tc_menu, false, "⌨ Ръчно")
                 .on_hover_text("Пишеш цифрите направо; 9 = 09. Tab минава към следващото поле.");
             ui.selectable_value(&mut s.tc_menu, true, "▼ Меню").on_hover_text("Часове, минути и секунди от падащи менюта");
+            ui.toggle_value(&mut s.tc_text, "1:23:45")
+                .on_hover_text("Включва/изключва поле до таймкода, в което се поставя целият таймкод наведнъж (напр. 1:23:45 или 83:45).");
         });
     }
 
     fn jobs_ui(&mut self, ui: &mut egui::Ui) {
         let handles = self.saved.settings.handles;
         let typed = !self.saved.settings.tc_menu;
+        let tc_text = self.saved.settings.tc_text;
         let mut show_log = None;
         let mut remove = None;
         let mut duplicate = None;
@@ -916,16 +946,21 @@ impl App {
             }
             let busy = matches!(status, Status::Queued | Status::Working);
             let imported = job.url.trim().is_empty() && job.done.is_some();
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            if idx > 0 {
+                ui.add_space(5.0);
+            }
+            card_frame(ui, idx).show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                // Повече въздух между редовете в картата.
+                ui.spacing_mut().item_spacing.y = 9.0;
                 ui.add_enabled_ui(!busy, |ui| {
                     ui.horizontal(|ui| {
                         ui.strong(format!("{:>2}.", idx + 1));
                         let w = (ui.available_width() - 400.0).max(200.0);
                         let hint = if imported { "(видео от диска)" } else { "Линк (YouTube, bnt.bg …)" };
-                        let r = ui.add(egui::TextEdit::singleline(&mut job.url).hint_text(hint).desired_width(w));
+                        let r = framed_text(ui, egui::TextEdit::singleline(&mut job.url).hint_text(hint).desired_width(w));
                         let pasted = edit_menu(&r, &mut job.url);
-                        let n = ui.add(egui::TextEdit::singleline(&mut job.name).hint_text("Име на файла (по избор)").desired_width(200.0));
+                        let n = framed_text(ui, egui::TextEdit::singleline(&mut job.name).hint_text("Име на файла (по избор)").desired_width(200.0));
                         edit_menu(&n, &mut job.name);
                         if ui.button("Дублирай").on_hover_text("Нов ред със същия линк — за следващ откъс").clicked() {
                             duplicate = Some(idx);
@@ -940,9 +975,9 @@ impl App {
                     if !imported {
                         ui.horizontal(|ui| {
                             let old_start = job.start;
-                            let changed_a = tc_ui(ui, ("start", job.id), "Начало:", &mut job.start, typed);
+                            let changed_a = tc_ui(ui, ("start", job.id), "Начало:", &mut job.start, typed, tc_text);
                             ui.add_space(16.0);
-                            let changed_b = tc_ui(ui, ("end", job.id), "Край:", &mut job.end, typed);
+                            let changed_b = tc_ui(ui, ("end", job.id), "Край:", &mut job.end, typed, tc_text);
                             if (changed_a || changed_b) && matches!(status, Status::Done | Status::Failed | Status::Cancelled) {
                                 *job.state.lock().unwrap() = Default::default();
                             }
@@ -991,7 +1026,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.colored_label(egui::Color32::from_rgb(40, 170, 80), format!("✔ {info}"));
                             if let Some(p) = output {
-                                let label = if job.edit.is_some() { "✂ Редактирай (има промени)" } else { "✂ Редактирай" };
+                                let label = "✂ Редактирай";
                                 if ui.add(colored_button(label, PURPLE)).clicked() {
                                     edit = Some((p.clone(), marks, job.edit.clone()));
                                 }
@@ -1076,6 +1111,31 @@ const PURPLE: egui::Color32 = egui::Color32::from_rgb(120, 80, 170);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(170, 115, 30);
 const SLATE: egui::Color32 = egui::Color32::from_rgb(75, 85, 100);
 
+/// Рамка за едно видео на началната страница: всяко е в лека рамка, а четните (2, 4, …) са и с по-тъмен фон,
+/// за да се отличават видеата едно от друго, без да се губи текстът.
+fn card_frame(ui: &egui::Ui, idx: usize) -> egui::Frame {
+    let dark = ui.visuals().dark_mode;
+    let line = if dark { egui::Color32::from_gray(55) } else { egui::Color32::from_gray(200) };
+    let frame = egui::Frame::none()
+        .rounding(6.0)
+        .inner_margin(egui::Margin::symmetric(12.0, 14.0))
+        .stroke(egui::Stroke::new(1.0_f32, line));
+    if idx % 2 == 0 {
+        return frame;
+    }
+    frame.fill(if dark { egui::Color32::from_rgb(12, 13, 17) } else { egui::Color32::from_rgb(218, 222, 230) })
+}
+
+/// Текстово поле с лека рамка — иначе на тъмния фон на картите се слива с него.
+fn framed_text(ui: &mut egui::Ui, edit: egui::TextEdit) -> egui::Response {
+    ui.scope(|ui| {
+        let line = if ui.visuals().dark_mode { egui::Color32::from_gray(75) } else { egui::Color32::from_gray(170) };
+        ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, line);
+        ui.add(edit)
+    })
+    .inner
+}
+
 fn colored_button(text: &str, fill: egui::Color32) -> egui::Button<'static> {
     egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE).strong()).fill(fill)
 }
@@ -1133,7 +1193,7 @@ fn log_buttons(ui: &mut egui::Ui, log: String) -> Option<String> {
 }
 
 /// ЧЧ:ММ:СС — падащи менюта или (`typed`) полета за писане + поле за бързо въвеждане на таймкод.
-fn tc_ui(ui: &mut egui::Ui, id: (&str, u64), label: &str, tc: &mut Tc, typed: bool) -> bool {
+fn tc_ui(ui: &mut egui::Ui, id: (&str, u64), label: &str, tc: &mut Tc, typed: bool, with_text: bool) -> bool {
     let before = *tc;
     ui.label(label);
     let combo = |ui: &mut egui::Ui, salt: &str, v: &mut u32, max: u32, hint: &str| {
@@ -1160,6 +1220,9 @@ fn tc_ui(ui: &mut egui::Ui, id: (&str, u64), label: &str, tc: &mut Tc, typed: bo
     ui.weak("с");
     combo(ui, "s", &mut tc.s, 59, "секунди");
 
+    if !with_text {
+        return *tc != before;
+    }
     let text_id = egui::Id::new((id, "text"));
     let mut text: String = ui.data_mut(|d| d.get_temp(text_id)).unwrap_or_default();
     let r = ui.add(egui::TextEdit::singleline(&mut text).hint_text("или 1:23:45").desired_width(70.0));
@@ -1204,23 +1267,26 @@ fn typed_field(ui: &mut egui::Ui, fid: egui::Id, v: &mut u32, max: u32, hint: &s
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Първият кадър се рисува в скрития прозорец, във втория той се показва както е бил затворен.
+        if self.shown {
+            if let Some(p) = winshow::get(self.hwnd) {
+                self.saved.main_win = Some(p);
+            }
+        } else if ctx.cumulative_pass_nr() >= 1 {
+            self.shown = true;
+            winshow::show(ctx, self.hwnd, self.saved.main_win);
+        } else {
+            // Първи кадър: прозорецът е още скрит — получава крайния си размер, преди eframe да го покаже.
+            self.hwnd = winshow::frame_hwnd(frame);
+            winshow::prepare(self.hwnd, self.saved.main_win);
+            ctx.request_repaint();
+        }
         let active = self.active.load(Ordering::SeqCst);
         if active == 0 {
             self.cancel.store(false, Ordering::SeqCst);
         } else {
             worker::ensure_workers(&self.queue, &self.active, &self.cancel, self.saved.settings.parallel, &self.tools, ctx);
-        }
-
-        // Запомненият размер може да е миниатюрен (напр. затворен минимизиран) — тогава се връща нормалният.
-        if self.size_checks < 10 {
-            self.size_checks += 1;
-            let (inner, minimized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().minimized.unwrap_or(false)));
-            if !minimized && inner.is_some_and(|r| r.width() < 800.0 || r.height() < 400.0) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1100.0, 760.0)));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(80.0, 60.0)));
-                self.size_checks = 10;
-            }
         }
 
         let title = format!("PP Downloader — {}", self.project.name);
@@ -1325,6 +1391,9 @@ impl eframe::App for App {
         let clips = self.clip_refs();
         for e in &mut self.editors {
             e.show(ctx, &clips);
+            if e.shown && e.place.is_some() && e.place != self.saved.editor_win {
+                self.saved.editor_win = e.place;
+            }
         }
         let switches: Vec<(usize, PathBuf)> =
             self.editors.iter_mut().enumerate().filter_map(|(i, e)| Some((i, e.switch_to.take()?))).collect();
@@ -1351,14 +1420,36 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_all();
+        self.quick.cancel.store(true, Ordering::SeqCst);
         self.autosave();
+        for e in &mut self.editors {
+            e.shutdown();
+        }
+        // Затварят ffmpeg процесите на прегледа и звука.
+        self.editors.clear();
+        // Предпазна мрежа: ако нещо при затварянето увисне (нишка, звуков драйвер, прозорец), процесът
+        // не бива да остава в паметта — иначе exe-то е заключено и не може да се обнови.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::process::exit(0);
+        });
     }
 }
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 760.0]).with_min_inner_size([800.0, 400.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 760.0])
+            .with_min_inner_size([800.0, 400.0])
+            .with_visible(false)
+            .with_icon(egui::IconData { rgba: include_bytes!("../assets/icon_64.rgba").to_vec(), width: 64, height: 64 }),
+        // Размерът и позицията се запомнят от нас (виж `winshow`) — така прозорецът се показва направо такъв.
+        persist_window: false,
         ..Default::default()
     };
-    eframe::run_native("PP Downloader", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    let result = eframe::run_native("PP Downloader", options, Box::new(|cc| Ok(Box::new(App::new(cc)))));
+    // Кратка пауза, за да убият нишките своите yt-dlp/ffmpeg процеси (проверяват отказа на ~150 ms),
+    // после излизаме, без да чакаме фоновите нишки — всичко нужно е записано в on_exit.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
 }

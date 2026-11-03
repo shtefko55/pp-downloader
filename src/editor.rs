@@ -3,6 +3,7 @@
 use crate::blur::{self, Alpha};
 use crate::export::{self, ExportJob, ExportStatus};
 use crate::media::{self, AudioData, AudioOut, Frame, FrameFetcher, FrameStream, Info};
+use crate::track;
 use eframe::egui::{self, pos2, vec2, Color32, CursorIcon, Key, Modifiers, Pos2, Rect, Sense, Shape, Stroke};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -32,6 +33,14 @@ impl Kind {
     }
 }
 
+/// Положение на маската в даден момент (секунди от клипа); между ключовете — линейно.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub struct Keyframe {
+    pub t: f64,
+    pub offset: [f32; 2],
+    pub scale: f32,
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct Mask {
     #[serde(default)]
@@ -47,11 +56,105 @@ pub struct Mask {
     /// Кога се вижда маската: подредени участъци [от, до) в секунди от клипа. Празно = през целия клип.
     #[serde(default)]
     pub spans: Vec<[f64; 2]>,
+    /// Движение: подредени по време ключове. Празно = неподвижна (`offset`/`scale`), иначе те не се ползват.
+    #[serde(default)]
+    pub keys: Vec<Keyframe>,
 }
 
 impl Mask {
     fn new(kind: Kind, points: Vec<[f32; 2]>) -> Self {
-        Mask { kind, points, offset: [0.0, 0.0], scale: 1.0, blur: 25.0, feather: 8.0, spans: Vec::new() }
+        Mask { kind, points, offset: [0.0, 0.0], scale: 1.0, blur: 15.0, feather: 3.0, spans: Vec::new(), keys: Vec::new() }
+    }
+
+    /// Преместване и мащаб в момента `t`.
+    pub fn transform_at(&self, t: f64) -> ([f32; 2], f32) {
+        let k = &self.keys;
+        let (Some(first), Some(last)) = (k.first(), k.last()) else { return (self.offset, self.scale) };
+        if t <= first.t {
+            return (first.offset, first.scale);
+        }
+        if t >= last.t {
+            return (last.offset, last.scale);
+        }
+        let i = k.partition_point(|key| key.t <= t);
+        let (a, b) = (k[i - 1], k[i]);
+        let u = ((t - a.t) / (b.t - a.t).max(1e-9)) as f32;
+        let lerp = |x: f32, y: f32| x + (y - x) * u;
+        ([lerp(a.offset[0], b.offset[0]), lerp(a.offset[1], b.offset[1])], lerp(a.scale, b.scale))
+    }
+
+    /// Ключът точно в този кадър (до половин кадър разлика).
+    pub fn key_at(&self, t: f64, fps: f64) -> Option<usize> {
+        self.keys.iter().position(|k| (k.t - t).abs() < 0.5 / fps)
+    }
+
+    /// Задава положението в `t`: без ключове — за целия клип, иначе създава/сменя ключ в този кадър.
+    pub fn set_transform_at(&mut self, t: f64, fps: f64, offset: [f32; 2], scale: f32) {
+        if self.keys.is_empty() {
+            self.offset = offset;
+            self.scale = scale;
+            return;
+        }
+        let key = Keyframe { t: snap(t, fps), offset, scale };
+        match self.key_at(t, fps) {
+            Some(i) => self.keys[i] = key,
+            None => {
+                let i = self.keys.partition_point(|k| k.t < key.t);
+                self.keys.insert(i, key);
+            }
+        }
+    }
+
+    /// Добавя ключ в `t` с текущото положение (първият ключ включва движението).
+    pub fn add_key(&mut self, t: f64, fps: f64) {
+        let (o, s) = self.transform_at(t);
+        if self.keys.is_empty() {
+            self.keys.push(Keyframe { t: snap(t, fps), offset: o, scale: s });
+        } else {
+            self.set_transform_at(t, fps, o, s);
+        }
+    }
+
+    /// Маха ключа в `t`; без ключове маската остава неподвижна там, където е била в този кадър.
+    pub fn remove_key(&mut self, t: f64, fps: f64) {
+        if let Some(i) = self.key_at(t, fps) {
+            let k = self.keys.remove(i);
+            if self.keys.is_empty() {
+                self.offset = k.offset;
+                self.scale = k.scale;
+            }
+        }
+    }
+
+    /// Маха всички ключове; маската остава както е в `t`.
+    pub fn clear_keys(&mut self, t: f64) {
+        (self.offset, self.scale) = self.transform_at(t);
+        self.keys.clear();
+    }
+
+    /// Премества маската (и всички ключове) с `d`.
+    fn nudge(&mut self, d: [f32; 2]) {
+        self.offset = [self.offset[0] + d[0], self.offset[1] + d[1]];
+        for k in &mut self.keys {
+            k.offset = [k.offset[0] + d[0], k.offset[1] + d[1]];
+        }
+    }
+
+    /// Нова форма, която в момента `t` да изглежда точно като `eff`.
+    /// Без ключове — записва се директно; с ключове — точките се пресмятат обратно през положението в `t`.
+    fn set_shape_at(&mut self, t: f64, eff: Vec<[f32; 2]>) {
+        if self.keys.is_empty() {
+            self.points = eff;
+            self.offset = [0.0, 0.0];
+            self.scale = 1.0;
+            return;
+        }
+        let (o, s) = self.transform_at(t);
+        let n = eff.len().max(1) as f32;
+        let m = eff.iter().fold([0.0, 0.0], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
+        let c = [m[0] - o[0], m[1] - o[1]];
+        let s = s.max(1e-4);
+        self.points = eff.iter().map(|p| [c[0] + (p[0] - o[0] - c[0]) / s, c[1] + (p[1] - o[1] - c[1]) / s]).collect();
     }
 
     pub fn active_at(&self, t: f64) -> bool {
@@ -113,26 +216,41 @@ impl Mask {
         }
     }
 
-    /// Записва мащаба и преместването директно в точките.
-    fn bake(&mut self) {
-        self.points = self.effective();
-        self.offset = [0.0, 0.0];
-        self.scale = 1.0;
+    /// Контурът след мащаб (около центъра) и преместване — без ключовете.
+    pub fn effective(&self) -> Vec<[f32; 2]> {
+        self.shaped(self.offset, self.scale)
     }
 
-    /// Контурът след мащаб (около центъра) и преместване.
-    pub fn effective(&self) -> Vec<[f32; 2]> {
+    /// Контурът в момента `t` (с движението от ключовете).
+    pub fn effective_at(&self, t: f64) -> Vec<[f32; 2]> {
+        let (o, s) = self.transform_at(t);
+        self.shaped(o, s)
+    }
+
+    fn shaped(&self, offset: [f32; 2], scale: f32) -> Vec<[f32; 2]> {
         let n = self.points.len().max(1) as f32;
         let c = self.points.iter().fold([0.0, 0.0], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
         self.points
             .iter()
-            .map(|p| {
-                [c[0] + (p[0] - c[0]) * self.scale + self.offset[0], c[1] + (p[1] - c[1]) * self.scale + self.offset[1]]
-            })
+            .map(|p| [c[0] + (p[0] - c[0]) * scale + offset[0], c[1] + (p[1] - c[1]) * scale + offset[1]])
             .collect()
     }
 
-    /// Алфа маска с размер w×h; `px_scale` = w / ширината на оригинала.
+    /// Средата на обхващащата кутия на основната форма и центърът, около който се мащабира.
+    fn anchors(&self) -> ([f32; 2], [f32; 2]) {
+        let n = self.points.len().max(1) as f32;
+        let c = self.points.iter().fold([0.0, 0.0], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
+        let b = bbox(&self.points);
+        ([(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0], c)
+    }
+
+    /// Преместването, при което средата на кутията при мащаб `scale` е в `center`.
+    fn offset_for(&self, center: [f32; 2], scale: f32) -> [f32; 2] {
+        let (bc, c) = self.anchors();
+        [center[0] - c[0] - (bc[0] - c[0]) * scale, center[1] - c[1] - (bc[1] - c[1]) * scale]
+    }
+
+    /// Неподвижна алфа маска (без ключове).
     pub fn alpha(&self, w: usize, h: usize, px_scale: f32) -> Alpha {
         let pts: Vec<[f32; 2]> = self.effective().iter().map(|p| [p[0] * w as f32, p[1] * h as f32]).collect();
         blur::mask_alpha(&pts, w, h, self.feather * px_scale)
@@ -162,6 +280,9 @@ impl EditState {
         self.in_t = in_t;
         self.out_t = out_t;
         self.masks.retain_mut(|m| {
+            for k in &mut m.keys {
+                k.t += shift;
+            }
             if m.spans.is_empty() {
                 return true; // през целия клип
             }
@@ -230,6 +351,24 @@ enum Drag {
     Span(usize, bool),
 }
 
+/// Проследяване, което върви във фонова нишка.
+#[derive(Default)]
+struct TrackStatus {
+    running: bool,
+    progress: f32,
+    message: String,
+    done: Option<TrackDone>,
+}
+
+struct TrackDone {
+    mask: usize,
+    /// Формата на маската при старта — ако междувременно е сменена, резултатът не става.
+    points: Vec<[f32; 2]>,
+    w: usize,
+    h: usize,
+    result: Result<track::Outcome, String>,
+}
+
 pub struct Editor {
     pub path: PathBuf,
     pub state: EditState,
@@ -253,6 +392,15 @@ pub struct Editor {
     pending: Option<Frame>,
     fetcher: FrameFetcher,
     audio: Option<AudioOut>,
+    /// Audio scrubbing при влачене по timeline-а и кадър напред/назад.
+    scrub_on: bool,
+    last_scrub: Option<f64>,
+    /// Прозорецът е създаден скрит; след първия кадър се показва в запомненото състояние (виж `winshow`).
+    pub shown: bool,
+    first_pass: Option<u64>,
+    /// Прозорецът в Windows и текущото му състояние (размер, позиция, цял екран) — за запомняне.
+    pub hwnd: isize,
+    pub place: Option<crate::winshow::Place>,
     audio_data: Arc<Mutex<Option<Result<AudioData, String>>>>,
 
     frame: Option<Vec<u8>>,
@@ -270,7 +418,11 @@ pub struct Editor {
     resize: Option<Resize>,
     show_blur: bool,
     show_outlines: bool,
-    mask_cache: Vec<Option<(Mask, Alpha)>>,
+    /// По маска: контурът и feather-ът, за които е сметната алфата.
+    mask_cache: Vec<Option<(Vec<[f32; 2]>, f32, Alpha)>>,
+    track: Arc<Mutex<TrackStatus>>,
+    track_cancel: Arc<AtomicBool>,
+    track_scale: bool,
 
     view: (f64, f64),
     drag: Drag,
@@ -355,6 +507,12 @@ impl Editor {
             pending: None,
             fetcher,
             audio,
+            scrub_on: true,
+            last_scrub: None,
+            shown: false,
+            first_pass: None,
+            hwnd: 0,
+            place: None,
             audio_data,
             frame: None,
             frame_t: 0.0,
@@ -369,6 +527,9 @@ impl Editor {
             show_blur: true,
             show_outlines: true,
             mask_cache: Vec::new(),
+            track: Default::default(),
+            track_cancel: Default::default(),
+            track_scale: false,
             drag: Drag::None,
             export: Default::default(),
             clips: Vec::new(),
@@ -383,16 +544,41 @@ impl Editor {
         self.export.lock().unwrap().running
     }
 
+    /// При затваряне на програмата: спира експорта и проследяването (техните ffmpeg процеси се убиват).
+    pub fn shutdown(&mut self) {
+        self.export_cancel.store(true, Ordering::SeqCst);
+        self.track_cancel.store(true, Ordering::SeqCst);
+        self.pause();
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, clips: &[ClipRef]) {
         self.clips = clips.to_vec();
+        let title = format!("Редакция — {}", self.name);
         let builder = egui::ViewportBuilder::default()
-            .with_title(format!("Редакция — {}", self.name))
+            .with_title(title.clone())
             .with_inner_size([1320.0, 900.0])
-            .with_min_inner_size([960.0, 620.0]);
+            .with_min_inner_size([960.0, 620.0])
+            .with_visible(self.shown);
         let id = self.viewport;
         ctx.show_viewport_immediate(id, builder, |ctx, _| {
             if ctx.input(|i| i.viewport().close_requested()) {
                 self.open = false;
+            }
+            // Първият кадър се рисува в скрития прозорец, в следващия той се показва както е бил затворен.
+            if self.shown {
+                self.place = crate::winshow::get(self.hwnd).or(self.place);
+            } else {
+                let pass = ctx.cumulative_pass_nr();
+                match self.first_pass {
+                    Some(p) if pass > p => {
+                        self.shown = true;
+                        self.hwnd = crate::winshow::find_by_title(&title);
+                        crate::winshow::show(ctx, self.hwnd, self.place);
+                    }
+                    Some(_) => {}
+                    None => self.first_pass = Some(pass),
+                }
+                ctx.request_repaint();
             }
             self.tick(ctx);
             self.keys(ctx);
@@ -400,13 +586,14 @@ impl Editor {
             egui::SidePanel::right(egui::Id::new(("ed_side", id)))
                 .exact_width(300.0)
                 .show(ctx, |ui| {
-                    if self.clips.len() > 1 {
-                        egui::TopBottomPanel::bottom(egui::Id::new(("ed_clips", id)))
-                            .resizable(true)
-                            .default_height(280.0)
-                            .show_inside(ui, |ui| self.clips_ui(ui));
+                    // Отгоре маските (толкова място, колкото им трябва), под тях списъкът с клипове
+                    // до долния ръб на прозореца.
+                    let with_clips = self.clips.len() > 1;
+                    self.masks_ui(ui, if with_clips { 260.0 } else { 0.0 });
+                    if with_clips {
+                        ui.separator();
+                        self.clips_ui(ui);
                     }
-                    egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| self.masks_ui(ui));
                 });
             // Бутоните и таймкодовете стоят точно над waveform-а.
             egui::TopBottomPanel::bottom(egui::Id::new(("ed_timeline", id))).show(ctx, |ui| {
@@ -489,6 +676,17 @@ impl Editor {
         }
     }
 
+    /// Audio scrubbing: кратко парче звук от текущия кадър (само при пауза).
+    fn scrub_audio(&mut self) {
+        if self.playing || !self.scrub_on || self.last_scrub == Some(self.playhead) {
+            return;
+        }
+        self.last_scrub = Some(self.playhead);
+        if let Some(a) = &self.audio {
+            a.scrub(self.playhead, (self.frame_len() * 2.0).max(0.08));
+        }
+    }
+
     fn set_frame(&mut self, f: Frame) {
         self.frame = Some(f.rgba);
         self.frame_t = f.t;
@@ -496,6 +694,7 @@ impl Editor {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        self.poll_track();
         if let Some(a) = &self.audio {
             let s = &self.state;
             a.shared.set_fades(s.in_t, s.out_t, s.fade_in, s.fade_out);
@@ -580,6 +779,12 @@ impl Editor {
             }
         }
         let esc = take(Modifiers::NONE, Key::Escape);
+        if take(Modifiers::NONE, Key::K) {
+            let (t, fps) = (self.playhead, self.info.fps);
+            if let Some(m) = self.selected.and_then(|i| self.state.masks.get_mut(i)) {
+                m.add_key(t, fps);
+            }
+        }
         if space {
             self.toggle_play();
         }
@@ -589,6 +794,8 @@ impl Editor {
                     self.pause();
                 }
                 self.seek(self.playhead + delta);
+                self.last_scrub = None;
+                self.scrub_audio();
             }
         }
         if key_i {
@@ -631,10 +838,13 @@ impl Editor {
                 if !m.active_at(self.frame_t) {
                     continue;
                 }
-                if cache.as_ref().map_or(true, |(cm, _)| cm != m) {
-                    *cache = Some((m.clone(), m.alpha(self.pw, self.ph, sp)));
+                let eff = m.effective_at(self.frame_t);
+                if cache.as_ref().map_or(true, |(e, f, _)| *e != eff || *f != m.feather) {
+                    let pts: Vec<[f32; 2]> = eff.iter().map(|p| [p[0] * self.pw as f32, p[1] * self.ph as f32]).collect();
+                    let alpha = blur::mask_alpha(&pts, self.pw, self.ph, m.feather * sp);
+                    *cache = Some((eff, m.feather, alpha));
                 }
-                if let Some((_, alpha)) = cache {
+                if let Some((_, _, alpha)) = cache {
                     blur::apply_blur(&mut img, self.pw, self.ph, alpha, m.blur * sp);
                 }
             }
@@ -662,11 +872,13 @@ impl Editor {
         }
         let to_norm = |p: Pos2| [(p.x - rect.min.x) / rect.width(), (p.y - rect.min.y) / rect.height()];
         let to_screen = |q: &[f32; 2]| pos2(rect.min.x + q[0] * rect.width(), rect.min.y + q[1] * rect.height());
-        let hit = |masks: &[Mask], p: Pos2| masks.iter().rposition(|m| point_in_poly(to_norm(p), &m.effective()));
+        // Маските се показват и редактират такива, каквито са в показания кадър.
+        let (ft, fps) = (self.frame_t, self.info.fps);
+        let hit = |masks: &[Mask], p: Pos2| masks.iter().rposition(|m| point_in_poly(to_norm(p), &m.effective_at(ft)));
 
         // Точката за преоразмеряване на избраната маска под курсора.
         let handle_at = |masks: &[Mask], sel: Option<usize>, p: Pos2| {
-            let b = bbox(&masks.get(sel?)?.effective());
+            let b = bbox(&masks.get(sel?)?.effective_at(ft));
             (0..8).find(|&h| to_screen(&handle_pos(b, h)).distance(p) <= 8.0)
         };
         let shift = ui.input(|i| i.modifiers.shift);
@@ -729,9 +941,8 @@ impl Editor {
                 if resp.drag_started() {
                     let origin = ui.input(|i| i.pointer.press_origin());
                     if let Some((i, h)) = origin.and_then(|p| Some((self.selected?, handle_at(&self.state.masks, self.selected, p)?))) {
-                        let m = &mut self.state.masks[i];
-                        m.bake();
-                        self.resize = Some(Resize { mask: i, handle: h, start_box: bbox(&m.points), start_points: m.points.clone() });
+                        let eff = self.state.masks[i].effective_at(ft);
+                        self.resize = Some(Resize { mask: i, handle: h, start_box: bbox(&eff), start_points: eff });
                     } else {
                         let h = origin.and_then(|p| hit(&self.state.masks, p));
                         self.moving = h.is_some();
@@ -744,14 +955,14 @@ impl Editor {
                     if let Some(r) = &self.resize {
                         if let (Some(p), Some(m)) = (resp.interact_pointer_pos(), self.state.masks.get_mut(r.mask)) {
                             let nb = resized_box(r.start_box, r.handle, to_norm(p));
-                            m.points = remap(&r.start_points, r.start_box, nb);
+                            m.set_shape_at(ft, remap(&r.start_points, r.start_box, nb));
                         }
                         ui.ctx().set_cursor_icon(handle_cursor(r.handle));
                     } else if self.moving {
                         if let Some(m) = self.selected.and_then(|i| self.state.masks.get_mut(i)) {
                             let d = resp.drag_delta();
-                            m.offset[0] += d.x / rect.width();
-                            m.offset[1] += d.y / rect.height();
+                            let (o, sc) = m.transform_at(ft);
+                            m.set_transform_at(ft, fps, [o[0] + d.x / rect.width(), o[1] + d.y / rect.height()], sc);
                         }
                         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                     }
@@ -776,7 +987,7 @@ impl Editor {
             if !(self.show_outlines || sel) {
                 continue;
             }
-            let eff = m.effective();
+            let eff = m.effective_at(ft);
             let pts: Vec<Pos2> = eff.iter().map(to_screen).collect();
             let stroke = if sel { Stroke::new(2.0_f32, Color32::YELLOW) } else { Stroke::new(1.0_f32, Color32::from_white_alpha(170)) };
             if m.active_at(self.frame_t) {
@@ -848,6 +1059,10 @@ impl Editor {
             ui.separator();
             ui.label(egui::RichText::new(self.tc(self.playhead)).monospace().size(20.0).strong());
             ui.weak(format!("/ {}", self.tc(self.info.duration)));
+            if self.info.has_audio {
+                ui.toggle_value(&mut self.scrub_on, "🔊 Scrub")
+                    .on_hover_text("Audio scrubbing: чуваш звука, докато влачиш по timeline-а или местиш кадър по кадър");
+            }
             center_end(ui, transport_id, x0);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.export_ui(ui));
@@ -981,6 +1196,102 @@ impl Editor {
         });
     }
 
+    // ---------- проследяване ----------
+
+    fn start_track(&mut self, i: usize, forward: bool, ctx: &egui::Context) {
+        if self.playing {
+            self.pause();
+            self.seek(self.playhead);
+        }
+        let (fps, fl) = (self.info.fps, self.frame_len());
+        let t0 = snap(self.playhead, fps);
+        let Some(m) = self.state.masks.get(i) else { return };
+        let say = |msg: &str| self.track.lock().unwrap().message = msg.to_string();
+        if !m.active_at(t0) {
+            return say("Маската е скрита в този кадър — проследяването тръгва от кадър, в който се вижда.");
+        }
+        // Докъдето стига откъсът IN–OUT (ако сме в него) и видимият участък на маската.
+        let s = &self.state;
+        let (mut lo, mut hi) = if t0 >= s.in_t && t0 < s.out_t { (s.in_t, s.out_t) } else { (0.0, self.info.duration) };
+        if let Some(k) = m.span_at(t0) {
+            lo = lo.max(m.spans[k][0]);
+            hi = hi.min(m.spans[k][1]);
+        }
+        let limit = if forward { hi } else { lo };
+        let frames = ((limit - t0).abs() / fl).round() as usize;
+        if frames <= usize::from(forward) {
+            return say(if forward { "Това е последният кадър — няма накъде напред." } else { "Това е първият кадър — няма накъде назад." });
+        }
+        let w = self.pw.min(640) / 2 * 2;
+        let h = (((w as f64 * self.ph as f64 / self.pw as f64).round() as usize) / 2 * 2).max(2);
+        let req = track::Request {
+            ffmpeg: self.ffmpeg.clone(),
+            path: self.path.clone(),
+            fps,
+            t0,
+            limit,
+            forward,
+            w,
+            h,
+            poly: m.effective_at(t0).iter().map(|p| [p[0] * w as f32, p[1] * h as f32]).collect(),
+            with_scale: self.track_scale,
+        };
+        let points = m.points.clone();
+        *self.track.lock().unwrap() = TrackStatus { running: true, ..Default::default() };
+        self.track_cancel.store(false, Ordering::SeqCst);
+        let (status, cancel, ctx) = (self.track.clone(), self.track_cancel.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let (st, c) = (status.clone(), ctx.clone());
+            let result = track::run(&req, &cancel, |p| {
+                st.lock().unwrap().progress = p;
+                c.request_repaint_of(egui::ViewportId::ROOT);
+            });
+            let mut s = status.lock().unwrap();
+            s.running = false;
+            s.done = Some(TrackDone { mask: i, points, w, h, result });
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        });
+    }
+
+    /// Готовото проследяване става ключове на маската (заменят старите в проследения участък).
+    fn poll_track(&mut self) {
+        let Some(d) = self.track.lock().unwrap().done.take() else { return };
+        let fps = self.info.fps;
+        let mut seek_to = None;
+        let msg = match (d.result, self.state.masks.get_mut(d.mask)) {
+            (Err(e), _) => format!("✖ {e}"),
+            (Ok(_), None) => "Маската е изтрита по време на проследяването.".into(),
+            (Ok(_), Some(m)) if m.points != d.points => "Маската е променена по време на проследяването — пусни го пак.".into(),
+            (Ok(out), Some(m)) => {
+                let (t_first, t_last) = (out.samples[0].0, out.samples.last().map_or(0.0, |s| s.0));
+                let s0 = m.transform_at(t_first).1;
+                let (lo, hi) = (t_first.min(t_last) - 0.5 / fps, t_first.max(t_last) + 0.5 / fps);
+                m.keys.retain(|k| k.t < lo || k.t > hi);
+                let keys = track::simplify(&out.samples, 0.5);
+                let n = keys.len();
+                for (t, p) in keys {
+                    let scale = s0 * p.scale;
+                    let offset = m.offset_for([p.cx / d.w as f32, p.cy / d.h as f32], scale);
+                    m.keys.push(Keyframe { t: snap(t, fps), offset, scale });
+                }
+                m.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+                let tc = fmt_tc(t_last, fps);
+                if let Some(t) = out.lost_at {
+                    seek_to = Some(t_last);
+                    format!("⚠ Обектът се изгуби при {} — нагласи маската там и пусни проследяването оттам.", fmt_tc(t, fps))
+                } else if out.cancelled {
+                    format!("Спряно при {tc} ({n} ключа).")
+                } else {
+                    format!("✔ Проследено до {tc} ({n} ключа).")
+                }
+            }
+        };
+        self.track.lock().unwrap().message = msg;
+        if let Some(t) = seek_to {
+            self.seek(t);
+        }
+    }
+
     fn clips_ui(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -995,7 +1306,7 @@ impl Editor {
             ui.colored_label(Color32::from_rgb(220, 60, 60), &self.switch_error);
         }
         let mut pick = None;
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("clips").auto_shrink(false).show(ui, |ui| {
             for c in &self.clips {
                 let current = c.path == self.path;
                 let mut marks = Vec::new();
@@ -1026,39 +1337,15 @@ impl Editor {
         }
     }
 
-    fn masks_ui(&mut self, ui: &mut egui::Ui) {
-        if self.info.has_audio {
-            ui.add_space(8.0);
-            ui.heading("Звук");
-            let max = self.state.out_t - self.state.in_t;
-            let s = &mut self.state;
-            egui::Grid::new(("fades", self.viewport)).num_columns(3).show(ui, |ui| {
-                for fade_in in [true, false] {
-                    let other = if fade_in { s.fade_out } else { s.fade_in };
-                    let (label, v) = if fade_in { ("Fade in:", &mut s.fade_in) } else { ("Fade out:", &mut s.fade_out) };
-                    let limit = (max - other).max(0.0);
-                    ui.label(label);
-                    ui.add(egui::DragValue::new(v).range(0.0..=limit).speed(0.02).fixed_decimals(2).suffix(" сек"));
-                    ui.horizontal(|ui| {
-                        for preset in [0.0_f64, 0.5, 1.0] {
-                            if ui.small_button(if preset == 0.0 { "няма".to_string() } else { format!("{preset}") }).clicked() {
-                                *v = preset.min(limit);
-                            }
-                        }
-                    });
-                    ui.end_row();
-                }
-            });
-            ui.weak("Звукът плавно се усилва след IN и затихва преди OUT. Може и с влачене на кръгчетата в timeline-а.");
-            ui.separator();
-        }
+    /// `reserve`: колко място да остане отдолу (за списъка с клипове).
+    fn masks_ui(&mut self, ui: &mut egui::Ui, reserve: f32) {
         ui.add_space(8.0);
         ui.heading("Blur маски");
         ui.add_space(4.0);
         ui.label("Нова маска:");
-        let w = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
+        let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
         ui.horizontal(|ui| {
-            for (kind, label) in [(Kind::Rect, "▭ Правоъг."), (Kind::Ellipse, "○ Кръг"), (Kind::Lasso, "✏ Ласо")] {
+            for (kind, label) in [(Kind::Rect, "▭ Правоъгълник"), (Kind::Ellipse, "○ Кръг")] {
                 let active = self.tool == Tool::Draw(kind);
                 let fill = if active { Color32::from_rgb(0, 150, 190) } else { crate::PURPLE };
                 if ui.add(crate::colored_button(label, fill).min_size(vec2(w, 32.0))).clicked() {
@@ -1079,8 +1366,20 @@ impl Editor {
         let mut remove = None;
         let mut duplicate = None;
         let mut seek_to = None;
+        let mut track_go = None;
         let (t, dur, fps) = (self.playhead, self.info.duration, self.info.fps);
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        let (trk_running, trk_progress, trk_msg) = {
+            let st = self.track.lock().unwrap();
+            (st.running, st.progress, st.message.clone())
+        };
+        if trk_running {
+            ui.ctx().request_repaint_after_for(std::time::Duration::from_millis(200), egui::ViewportId::ROOT);
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("masks")
+            .auto_shrink([false, true])
+            .max_height((ui.available_height() - reserve).max(150.0))
+            .show(ui, |ui| {
             if self.state.masks.is_empty() {
                 ui.weak("Няма маски.");
             }
@@ -1103,12 +1402,73 @@ impl Editor {
                     });
                     if sel {
                         let m = &mut self.state.masks[i];
-                        ui.add(egui::Slider::new(&mut m.scale, 0.2..=3.0).text("Мащаб").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                        let (o, mut scale) = m.transform_at(t);
+                        if ui.add(egui::Slider::new(&mut scale, 0.2..=3.0).text("Мащаб").custom_formatter(|v, _| format!("{:.0}%", v * 100.0))).changed() {
+                            m.set_transform_at(t, fps, o, scale);
+                        }
                         ui.add(egui::Slider::new(&mut m.blur, 1.0..=120.0).text("Blur").integer());
                         ui.add(egui::Slider::new(&mut m.feather, 0.0..=80.0).text("Feather").integer());
-                        if ui.small_button("Върни позиция и размер").clicked() {
+                        if ui.small_button("Върни позиция и размер").on_hover_text("Маха и ключовете за движение").clicked() {
                             m.offset = [0.0, 0.0];
                             m.scale = 1.0;
+                            m.keys.clear();
+                        }
+                        ui.separator();
+                        ui.label(egui::RichText::new("Движение").strong());
+                        ui.horizontal(|ui| {
+                            let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                            if ui
+                                .add_enabled(!trk_running, crate::colored_button("◀ Проследи назад", crate::BLUE).min_size(vec2(w, 26.0)))
+                                .on_hover_text("Маската следва обекта под нея от този кадър към началото")
+                                .clicked()
+                            {
+                                track_go = Some((i, false));
+                            }
+                            if ui
+                                .add_enabled(!trk_running, crate::colored_button("Проследи напред ▶", crate::BLUE).min_size(vec2(w, 26.0)))
+                                .on_hover_text("Маската следва обекта под нея от този кадър към края (до OUT или до скриването ѝ)")
+                                .clicked()
+                            {
+                                track_go = Some((i, true));
+                            }
+                        });
+                        if trk_running {
+                            ui.horizontal(|ui| {
+                                if ui.add(crate::colored_button("Спри", crate::RED)).on_hover_text("Проследеното дотук се запазва").clicked() {
+                                    self.track_cancel.store(true, Ordering::SeqCst);
+                                }
+                                ui.add(egui::ProgressBar::new(trk_progress).text(format!("Проследяване {:.0}%", trk_progress * 100.0)));
+                            });
+                        }
+                        ui.checkbox(&mut self.track_scale, "Следи и размера (приближаване)");
+                        ui.horizontal(|ui| {
+                            if ui.small_button("◀").on_hover_text("Предишен ключ").clicked() {
+                                seek_to = m.keys.iter().rev().find(|k| k.t < t - 0.5 / fps).map(|k| k.t);
+                            }
+                            if m.key_at(t, fps).is_some() {
+                                if ui.button("✖ Махни ключа").on_hover_text("Махни ключа в този кадър").clicked() {
+                                    m.remove_key(t, fps);
+                                }
+                            } else if ui.button("◆ Ключ тук  [K]").on_hover_text("Запомни положението на маската в този кадър").clicked() {
+                                m.add_key(t, fps);
+                            }
+                            if ui.small_button("▶").on_hover_text("Следващ ключ").clicked() {
+                                seek_to = m.keys.iter().find(|k| k.t > t + 0.5 / fps).map(|k| k.t);
+                            }
+                        });
+                        if m.keys.is_empty() {
+                            ui.weak("Неподвижна. С „Ключ тук“ или с проследяване маската започва да се движи.");
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Ключове: {}", m.keys.len()));
+                                if ui.small_button("Изтрий всички").on_hover_text("Маската остава неподвижна, както е в този кадър").clicked() {
+                                    m.clear_keys(t);
+                                }
+                            });
+                            ui.weak("Местене или мащаб в кадър без ключ добавя ключ там; между ключовете маската се движи плавно.");
+                        }
+                        if !trk_msg.is_empty() {
+                            ui.label(&trk_msg);
                         }
                         ui.separator();
                         ui.label(egui::RichText::new("Кога се вижда").strong());
@@ -1164,8 +1524,7 @@ impl Editor {
         });
         if let Some(i) = duplicate {
             let mut m = self.state.masks[i].clone();
-            m.offset[0] += 0.03;
-            m.offset[1] += 0.03;
+            m.nudge([0.03, 0.03]);
             self.state.masks.insert(i + 1, m);
             self.selected = Some(i + 1);
         }
@@ -1178,6 +1537,9 @@ impl Editor {
                 self.pause();
             }
             self.seek(t);
+        }
+        if let Some((i, forward)) = track_go {
+            self.start_track(i, forward, ui.ctx());
         }
     }
 
@@ -1306,6 +1668,21 @@ impl Editor {
         // Видимост на избраната маска: лента най-долу.
         let lane = Rect::from_min_max(pos2(wave.left(), wave.bottom() - 16.0), wave.max);
         // Маска през целия клип = един участък 0–край; ръбовете му се влачат веднага.
+        // Ключовете на избраната маска: ромбчета над лентата (клик = отиди на ключа).
+        let key_y = lane.top() - 7.0;
+        let key_xs: Vec<(f32, f64)> = self
+            .selected
+            .and_then(|i| self.state.masks.get(i))
+            .map(|m| m.keys.iter().map(|k| (tx(k.t), k.t)).filter(|(x, _)| *x >= r.left() - 5.0 && *x <= r.right() + 5.0).collect())
+            .unwrap_or_default();
+        for (x, _) in &key_xs {
+            let d = 4.5;
+            painter.add(Shape::convex_polygon(
+                vec![pos2(*x, key_y - d), pos2(x + d, key_y), pos2(*x, key_y + d), pos2(x - d, key_y)],
+                Color32::from_rgb(0, 220, 255),
+                Stroke::new(1.0_f32, Color32::BLACK),
+            ));
+        }
         let sel_mask = self.selected.and_then(|i| {
             let spans = &self.state.masks.get(i)?.spans;
             Some((i, if spans.is_empty() { vec![[0.0, dur]] } else { spans.clone() }))
@@ -1436,15 +1813,25 @@ impl Editor {
                             self.seek(edge);
                         }
                     }
-                    Drag::Playhead | Drag::None => self.seek(t),
+                    Drag::Playhead | Drag::None => {
+                        let on_key = resp.clicked() && (p.y - key_y).abs() < 8.0;
+                        let key = key_xs.iter().filter(|_| on_key).find(|(x, _)| (x - p.x).abs() < 6.0);
+                        self.seek(key.map_or(t, |k| k.1));
+                    }
                 }
+            }
+        }
+        if resp.dragged() || resp.clicked() {
+            if matches!(self.drag, Drag::Playhead | Drag::None | Drag::In | Drag::Out | Drag::Span(..)) {
+                self.scrub_audio();
             }
         }
         if resp.drag_stopped() {
             self.drag = Drag::None;
+            self.last_scrub = None;
         }
         ui.horizontal(|ui| {
-            ui.weak("Колелце: мащаб · Shift+колелце: превъртане · Влачи IN/OUT маркерите · ← → кадър · I / O задава IN/OUT · Интервал: пусни/пауза");
+            ui.weak("Колелце: мащаб · Shift+колелце: превъртане · Влачи IN/OUT маркерите · ← → кадър · I / O задава IN/OUT · K: ключ на маската · Интервал: пусни/пауза");
         });
         ui.add_space(2.0);
     }
@@ -1577,15 +1964,56 @@ mod tests {
         let nb = resized_box([0.2, 0.1, 0.6, 0.5], 7, [0.9, 0.3]);
         assert!(nb[0] < nb[2] && nb[1] == 0.1 && nb[3] == 0.5);
 
-        // bake запазва видимия контур.
+        // Нова форма без ключове: мащабът и преместването влизат в точките.
         let mut m = Mask::new(Kind::Rect, rect.clone());
         m.scale = 2.0;
         m.offset = [0.1, 0.0];
         let before = m.effective();
-        m.bake();
+        m.set_shape_at(0.0, before.clone());
         assert_eq!(m.points, before);
         let close = |a: &[[f32; 2]], b: &[[f32; 2]]| a.iter().zip(b).all(|(p, q)| (p[0] - q[0]).abs() < 1e-5 && (p[1] - q[1]).abs() < 1e-5);
         assert!(close(&m.effective(), &before));
+
+        // С ключове: в този момент формата е точно новата, а движението остава.
+        m.keys = vec![Keyframe { t: 0.0, offset: [0.0, 0.0], scale: 1.0 }, Keyframe { t: 2.0, offset: [0.2, 0.1], scale: 1.5 }];
+        let now = m.effective_at(1.0);
+        let target = remap(&now, bbox(&now), [0.1, 0.1, 0.5, 0.3]);
+        m.set_shape_at(1.0, target.clone());
+        assert!(close(&m.effective_at(1.0), &target));
+        assert_eq!(m.keys.len(), 2);
+    }
+
+    #[test]
+    fn keyframes() {
+        let mut m = Mask::new(Kind::Rect, Mask::shape_points(Kind::Rect, [0.1, 0.1], [0.3, 0.2]));
+        let fps = 25.0;
+        // Без ключове местенето е за целия клип.
+        m.set_transform_at(1.0, fps, [0.1, 0.0], 1.0);
+        assert!(m.keys.is_empty() && m.transform_at(7.0).0 == [0.1, 0.0]);
+        // Първи ключ, после местене в друг кадър → втори ключ; между тях — линейно.
+        m.add_key(1.0, fps);
+        m.set_transform_at(3.0, fps, [0.3, 0.2], 2.0);
+        assert_eq!(m.keys.len(), 2);
+        let (o, s) = m.transform_at(2.0);
+        assert!((o[0] - 0.2).abs() < 1e-6 && (o[1] - 0.1).abs() < 1e-6 && (s - 1.5).abs() < 1e-6);
+        assert_eq!(m.transform_at(0.0).0, [0.1, 0.0]);
+        assert_eq!(m.transform_at(9.0).0, [0.3, 0.2]);
+        // Същият кадър (до половин кадър) сменя ключа, не добавя нов.
+        m.set_transform_at(3.01, fps, [0.4, 0.2], 2.0);
+        assert_eq!(m.keys.len(), 2);
+        // offset_for поставя средата на кутията точно там, където е поискана.
+        let o = m.offset_for([0.5, 0.5], 1.7);
+        let b = bbox(&m.shaped(o, 1.7));
+        assert!(((b[0] + b[2]) / 2.0 - 0.5).abs() < 1e-5 && ((b[1] + b[3]) / 2.0 - 0.5).abs() < 1e-5);
+        // Махането на последния ключ оставя маската там, където е била.
+        m.remove_key(3.0, fps);
+        m.remove_key(1.0, fps);
+        assert!(m.keys.is_empty() && m.offset == [0.1, 0.0]);
+        // Смяна на таймкода мести и ключовете.
+        m.add_key(2.0, fps);
+        let mut st = EditState { masks: vec![m], ..Default::default() };
+        st.retime(1.5, 0.0, 10.0);
+        assert_eq!(st.masks[0].keys[0].t, 3.5);
     }
 
     #[test]

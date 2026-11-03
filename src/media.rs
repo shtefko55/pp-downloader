@@ -185,6 +185,8 @@ pub struct AudioShared {
     playing: AtomicBool,
     /// IN, OUT, fade in, fade out (секунди, f64 битове) — за fade-а при пускане.
     fades: [AtomicU64; 4],
+    /// Audio scrubbing при пауза: кратко парче [от, до) в кадри на звука.
+    scrub: [AtomicU64; 2],
 }
 
 impl AudioShared {
@@ -218,6 +220,7 @@ impl AudioOut {
             seek: AtomicI64::new(-1),
             playing: AtomicBool::new(false),
             fades: Default::default(),
+            scrub: Default::default(),
         });
         let quit = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -245,6 +248,20 @@ impl AudioOut {
 
     pub fn pause(&self) {
         self.shared.playing.store(false, Ordering::SeqCst);
+        self.shared.scrub[1].store(0, Ordering::SeqCst);
+    }
+
+    /// Audio scrubbing: при пауза пуска кратко парче звук от момента `t` (при влачене по timeline-а и кадър напред/назад).
+    pub fn scrub(&self, t: f64, len: f64) {
+        if self.shared.playing.load(Ordering::SeqCst) {
+            return;
+        }
+        let from = (t.max(0.0) * self.rate as f64).round() as u64;
+        let to = from + (len * self.rate as f64).round() as u64;
+        self.shared.scrub[1].store(0, Ordering::SeqCst);
+        self.shared.scrub[0].store(from, Ordering::SeqCst);
+        self.shared.seek.store(from as i64, Ordering::SeqCst);
+        self.shared.scrub[1].store(to, Ordering::SeqCst);
     }
 
     pub fn time(&self) -> f64 {
@@ -291,12 +308,21 @@ fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
                 let seek = sh.seek.swap(-1, Ordering::SeqCst);
                 let mut pos = if seek >= 0 { seek as u64 } else { sh.pos.load(Ordering::SeqCst) };
                 let playing = sh.playing.load(Ordering::SeqCst);
+                let (scrub_from, scrub_to) = (sh.scrub[0].load(Ordering::SeqCst), sh.scrub[1].load(Ordering::SeqCst));
+                // Плавно влизане/излизане на парчето при scrubbing (5 ms), за да няма пукане.
+                let ramp = (rate as f64 * 0.005).max(1.0);
                 let samples = sh.samples.try_lock().ok().map(|s| s.clone());
                 let [in_t, out_t, fade_in, fade_out] = sh.fades();
                 for frame in data.chunks_mut(channels) {
-                    let (l, r) = if playing {
+                    let scrubbing = !playing && pos >= scrub_from && pos < scrub_to;
+                    let (l, r) = if playing || scrubbing {
                         let i = pos as usize * 2;
-                        let g = crate::editor::fade_gain(pos as f64 / rate as f64, in_t, out_t, fade_in, fade_out);
+                        let g = if scrubbing {
+                            let edge = (pos - scrub_from).min(scrub_to - pos) as f64;
+                            (edge / ramp).min(1.0) as f32
+                        } else {
+                            crate::editor::fade_gain(pos as f64 / rate as f64, in_t, out_t, fade_in, fade_out)
+                        };
                         pos += 1;
                         samples.as_ref().and_then(|s| Some((*s.get(i)? * g, *s.get(i + 1)? * g))).unwrap_or((0.0, 0.0))
                     } else {

@@ -2697,14 +2697,16 @@ dependencies = [
 
 [[package]]
 name = "pp_downloader"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "arboard",
  "cpal",
  "eframe",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

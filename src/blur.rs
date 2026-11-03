@@ -59,15 +59,25 @@ pub fn mask_alpha(points: &[[f32; 2]], w: usize, h: usize, feather: f32) -> Alph
 
 /// Размазва RGBA кадъра там, където маската е > 0, със сила `sigma` (пиксели).
 pub fn apply_blur(frame: &mut [u8], w: usize, h: usize, alpha: &Alpha, sigma: f32) {
+    blur_channels(frame, w, h, 4, 3, alpha, sigma);
+}
+
+/// Същото за една равнина (Y, U или V) с по един байт на пиксел.
+pub fn blur_plane(plane: &mut [u8], w: usize, h: usize, alpha: &Alpha, sigma: f32) {
+    blur_channels(plane, w, h, 1, 1, alpha, sigma);
+}
+
+/// `step` байта на пиксел, от които се размазват първите `channels`.
+fn blur_channels(frame: &mut [u8], w: usize, h: usize, step: usize, channels: usize, alpha: &Alpha, sigma: f32) {
     if alpha.rect.is_empty() || sigma < 0.3 {
         return;
     }
     let reg = alpha.rect.expand((sigma * 2.0).ceil() as usize, w, h);
     let (rw, rh) = (reg.width(), reg.height());
-    let mut planes: Vec<Vec<f32>> = (0..3).map(|_| Vec::with_capacity(rw * rh)).collect();
+    let mut planes: Vec<Vec<f32>> = (0..channels).map(|_| Vec::with_capacity(rw * rh)).collect();
     for y in reg.y0..reg.y1 {
         for x in reg.x0..reg.x1 {
-            let i = (y * w + x) * 4;
+            let i = (y * w + x) * step;
             for (c, plane) in planes.iter_mut().enumerate() {
                 plane.push(frame[i + c] as f32);
             }
@@ -83,7 +93,7 @@ pub fn apply_blur(frame: &mut [u8], w: usize, h: usize, alpha: &Alpha, sigma: f3
             if a <= 0.002 {
                 continue;
             }
-            let i = (y * w + x) * 4;
+            let i = (y * w + x) * step;
             let j = (y - reg.y0) * rw + (x - reg.x0);
             for (c, plane) in planes.iter().enumerate() {
                 let o = frame[i + c] as f32;

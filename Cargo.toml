@@ -1,6 +1,6 @@
 [package]
 name = "pp_downloader"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 
 [dependencies]
@@ -10,6 +10,11 @@ cpal = "0.15.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arboard = { version = "3.7", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+# Прозорците (размер/позиция при отваряне) и регистрацията на .ppdl файловете.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+raw-window-handle = "0.6"
 
 [profile.release]
 opt-level = 3
