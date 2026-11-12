@@ -933,6 +933,10 @@ impl App {
         let mut duplicate = None;
         let mut edit = None;
         let mut redownload = None;
+        // Отворените редактори може да имат по-нова редакция от реда — взима се преди евентуално пренагласяване.
+        self.store_edits();
+        // Клипове с променен таймкод: редакторите им се затварят, за да не върнат старите IN/OUT в реда.
+        let mut detached: Vec<PathBuf> = Vec::new();
         for (idx, job) in self.project.jobs.iter_mut().enumerate() {
             let (status, progress, info, output, marks) = {
                 let st = job.state.lock().unwrap();
@@ -980,6 +984,11 @@ impl App {
                             let changed_b = tc_ui(ui, ("end", job.id), "Край:", &mut job.end, typed, tc_text);
                             if (changed_a || changed_b) && matches!(status, Status::Done | Status::Failed | Status::Cancelled) {
                                 *job.state.lock().unwrap() = Default::default();
+                                // Веднага, а не чак в следващия кадър: иначе автоматичното записване
+                                // пак свързва реда със стария файл и редакцията му.
+                                if let Some((p, _, _)) = job.done.take() {
+                                    detached.push(p);
+                                }
                             }
                             // Запазената редакция е за стария откъс: без това редакторът би отворил
                             // новия файл със старите IN/OUT и експортът би спрял на стария край.
@@ -1062,6 +1071,9 @@ impl App {
                     }
                 }
             });
+        }
+        if !detached.is_empty() {
+            self.editors.retain(|e| !detached.contains(&e.path));
         }
         if let Some(i) = duplicate {
             let (url, name, end) = {
