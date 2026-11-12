@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "pp_downloader"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "arboard",
  "cpal",
